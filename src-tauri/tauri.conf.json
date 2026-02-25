@@ -16,7 +16,7 @@
         "label": "main",
         "title": "Claude Token Usage",
         "width": 400,
-        "height": 560,
+        "height": 600,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

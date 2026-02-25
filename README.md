@@ -2,6 +2,9 @@
 
 A lightweight macOS menu bar app that displays your Claude Code token usage. Built with Tauri v2, Svelte 5, and ECharts.
 
+![Toolbar](toolbar.png)
+![Window](window.png)
+
 ## How It Works
 
 The app reads usage data directly from Claude Code's local stats file (`~/.claude/stats-cache.json`), which is updated automatically each time a Claude Code session ends. No API keys or account configuration required.
