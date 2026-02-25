@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# Screenshots / temp files
+*.png
+!src-tauri/icons/*.png
+
+# Vite cache
+node_modules/.vite/
