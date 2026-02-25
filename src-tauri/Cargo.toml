@@ -19,3 +19,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["time"] }
 notify = "7"
 dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

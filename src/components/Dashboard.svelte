@@ -1,9 +1,19 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { getStats, getCurrentMonthPrefix, updateTrayTitle } from "../lib/api";
-  import { formatTokens } from "../lib/format";
-  import type { StatsCache, ModelSummary, DailyTokens } from "../lib/types";
+  import { getStats, getCurrentMonthPrefix } from "../lib/api";
+  import type { StatsCache } from "../lib/types";
+  import {
+    computeTotalTokens,
+    computeInputTokens,
+    computeOutputTokens,
+    computeCacheTokens,
+    computeModelSummaries,
+    computeDailyTokens,
+    computeMonthMessages,
+    computeMonthSessions,
+    computeMonthToolCalls,
+  } from "../lib/stats";
   import TokenSummary from "./TokenSummary.svelte";
   import DailyChart from "./DailyChart.svelte";
   import ModelBreakdown from "./ModelBreakdown.svelte";
@@ -22,91 +32,33 @@
 
   // Derived from stats
   let monthPrefix = $state(getCurrentMonthPrefix());
-  let totalTokens = $derived.by(() => {
-    if (!stats) return 0;
-    return Object.values(stats.modelUsage).reduce(
-      (sum, m) =>
-        sum +
-        m.inputTokens +
-        m.outputTokens +
-        m.cacheReadInputTokens +
-        m.cacheCreationInputTokens,
-      0,
-    );
-  });
-
-  let inputTokens = $derived.by(() => {
-    if (!stats) return 0;
-    return Object.values(stats.modelUsage).reduce(
-      (sum, m) => sum + m.inputTokens,
-      0,
-    );
-  });
-
-  let outputTokens = $derived.by(() => {
-    if (!stats) return 0;
-    return Object.values(stats.modelUsage).reduce(
-      (sum, m) => sum + m.outputTokens,
-      0,
-    );
-  });
-
-  let cacheTokens = $derived.by(() => {
-    if (!stats) return 0;
-    return Object.values(stats.modelUsage).reduce(
-      (sum, m) => sum + m.cacheReadInputTokens + m.cacheCreationInputTokens,
-      0,
-    );
-  });
-
-  let modelSummaries = $derived.by((): ModelSummary[] => {
-    if (!stats) return [];
-    return Object.entries(stats.modelUsage)
-      .map(([model, usage]) => ({
-        model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheReadTokens: usage.cacheReadInputTokens,
-        cacheCreationTokens: usage.cacheCreationInputTokens,
-        totalTokens:
-          usage.inputTokens +
-          usage.outputTokens +
-          usage.cacheReadInputTokens +
-          usage.cacheCreationInputTokens,
-      }))
-      .sort((a, b) => b.totalTokens - a.totalTokens);
-  });
-
-  let dailyTokens = $derived.by((): DailyTokens[] => {
-    if (!stats) return [];
-    return stats.dailyModelTokens
-      .filter((d) => d.date.startsWith(monthPrefix))
-      .map((d) => ({
-        date: d.date,
-        tokens: Object.values(d.tokensByModel).reduce((s, v) => s + v, 0),
-      }));
-  });
-
-  let monthMessages = $derived.by(() => {
-    if (!stats) return 0;
-    return stats.dailyActivity
-      .filter((d) => d.date.startsWith(monthPrefix))
-      .reduce((sum, d) => sum + d.messageCount, 0);
-  });
-
-  let monthSessions = $derived.by(() => {
-    if (!stats) return 0;
-    return stats.dailyActivity
-      .filter((d) => d.date.startsWith(monthPrefix))
-      .reduce((sum, d) => sum + d.sessionCount, 0);
-  });
-
-  let monthToolCalls = $derived.by(() => {
-    if (!stats) return 0;
-    return stats.dailyActivity
-      .filter((d) => d.date.startsWith(monthPrefix))
-      .reduce((sum, d) => sum + d.toolCallCount, 0);
-  });
+  let totalTokens = $derived.by(() =>
+    stats ? computeTotalTokens(stats.modelUsage) : 0,
+  );
+  let inputTokens = $derived.by(() =>
+    stats ? computeInputTokens(stats.modelUsage) : 0,
+  );
+  let outputTokens = $derived.by(() =>
+    stats ? computeOutputTokens(stats.modelUsage) : 0,
+  );
+  let cacheTokens = $derived.by(() =>
+    stats ? computeCacheTokens(stats.modelUsage) : 0,
+  );
+  let modelSummaries = $derived.by(() =>
+    stats ? computeModelSummaries(stats.modelUsage) : [],
+  );
+  let dailyTokens = $derived.by(() =>
+    stats ? computeDailyTokens(stats.dailyModelTokens, monthPrefix) : [],
+  );
+  let monthMessages = $derived.by(() =>
+    stats ? computeMonthMessages(stats.dailyActivity, monthPrefix) : 0,
+  );
+  let monthSessions = $derived.by(() =>
+    stats ? computeMonthSessions(stats.dailyActivity, monthPrefix) : 0,
+  );
+  let monthToolCalls = $derived.by(() =>
+    stats ? computeMonthToolCalls(stats.dailyActivity, monthPrefix) : 0,
+  );
 
   let unlisten: UnlistenFn | null = null;
 
