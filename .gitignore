@@ -20,7 +20,6 @@ src-tauri/target/
 .env.*
 
 # Screenshots / temp files
-*.png
 !src-tauri/icons/*.png
 
 # Vite cache
