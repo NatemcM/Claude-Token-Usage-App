@@ -52,13 +52,25 @@ disappear between ingest passes as a matter of routine.
 | Measure | Value |
 |---|---|
 | Usage-bearing assistant lines | 124,510 |
-| Distinct `message.id` | 45,734 |
+| Distinct `(file, message.id)` | 45,873 |
 | Line duplication | 2.72x |
-| **Output-token inflation if undeduped** | **4.70x** (98.5M vs 20.9M actual) |
+| **Output-token inflation if undeduped** | **2.56x** (98.5M raw vs 38.6M actual) |
+| **Undercount if deduped first-wins** | **-45%** (21.2M vs 38.6M actual) |
 
-Two mechanisms: every content block emits its own line (`apiBlockIndex` 0..k) carrying an
-*identical and complete* usage object; and whole messages are re-emitted non-consecutively
-later in the same file, usually with different `uuid`s.
+Each line carries exactly **one** content block, not the full array. Two duplication
+mechanisms: every content block emits its own line, and whole messages are re-emitted
+non-consecutively later in the same file, usually with different `uuid`s.
+
+**Copies are NOT identical, and this is the trap.** For 13,982 of 45,873 messages (30%) the
+first copy seen carries a *smaller* `output_tokens` than later copies: Claude Code writes the
+first block line while the response is still streaming (that first block is `thinking` in
+28,601 cases, `tool_use` in 11,804, `text` in 5,468) and the final block carries the true
+total. One measured example went 7 -> 156.
+
+Therefore dedup must take the **per-field maximum** across copies, not first-wins. First-wins
+is not a conservative approximation — it silently loses 45% of output tokens, and it looks
+plausible, which is worse. Any verification script must also take the max, or it will
+"confirm" the undercount. `input_tokens` and cache fields diverge in only 3 records.
 
 `message.id` never appears in more than one file. `requestId` is 1:1 with `message.id` but is
 **absent on 18 records**, so it must not form part of the dedup key.
@@ -226,9 +238,18 @@ leaves `content` lazy.
 
 ### 5.3 Parsing rules
 
-- **Dedup on `hash(message.id)` alone**, per file (`message.id` never spans files). Take
-  **max per field** across copies — content-block copies are identical, and max makes any
-  observed divergence moot.
+- **Dedup on `hash(message.id)` alone**, per file (`message.id` never spans files), taking the
+  **per-field maximum** across copies. This is mandatory, not defensive: early copies are
+  written mid-stream with partial `output_tokens` (§2.3), so first-wins undercounts by 45%.
+  Implementation keeps the credited counts per message id and adds only the positive
+  per-field delta when a later copy exceeds them.
+- **Tool calls dedupe on the `tool_use` block's own `id`**, and **user messages on the record
+  `uuid`** — one key cannot serve all three metrics, because each line carries a single
+  content block. Observed: 68,492 raw tool_use blocks vs 54,229 distinct ids; 72,443 user
+  records vs 57,122 distinct uuids.
+- **User records whose content is only `tool_result` blocks are not messages.** 68,600 of
+  70,308 array-content user records are tool-result echoes; counting them would report
+  ~100k "messages" a month beside legacy days of ~25.
 - Count `<synthetic>` as excluded.
 - **Keep raw model ids.** Family grouping (Opus/Sonnet/Haiku/Fable) is a display-level toggle
   at most; collapsing `claude-opus-4-8` into `claude-opus-5` would destroy detail
@@ -390,7 +411,8 @@ no-transcript row, and the kill confirm state machine through Force kill.
 
 **Manual verification** (tests cannot prove we read the real Claude Code):
 `npx tauri dev`; confirm the live list matches `ps` exactly; confirm dashboard totals are
-plausible against a known session rather than ~4.7x inflated; start a throwaway session
+plausible against a per-field-max count rather than ~2.5x inflated or 45% short; start a
+throwaway session
 (`cd /tmp/scratch && claude`), confirm it appears with correct project and idle age, kill it
 from the panel, and confirm both process and row disappear along with its `sessions/<pid>.*`.
 
@@ -410,5 +432,11 @@ real data; Phase 4 may never be written.
 - **Duplication semantics could change.** If upstream stops re-emitting blocks, dedup becomes
   a no-op — harmless. If it changes `message.id` reuse, totals break; the inflation regression
   test is the tripwire.
+- **Day bucketing uses a single fixed UTC offset**, captured at ingest. In a DST zone the
+  offset changes twice a year, so messages within an hour of local midnight can land in the
+  neighbouring day, and the offset change forces a (non-destructive) rebuild. Accepted:
+  per-timestamp `Local` bucketing would fix it but makes every ingest test depend on the
+  machine's timezone. Revisit if day boundaries ever matter more than they do for a
+  token dashboard.
 - **`sysinfo` on a future sandboxed/notarized build** may lose visibility of other processes.
   Recorded as the hard constraint in §3.

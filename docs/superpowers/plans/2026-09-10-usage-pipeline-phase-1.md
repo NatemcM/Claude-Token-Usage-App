@@ -13,9 +13,10 @@
 ## Global Constraints
 
 - **Three independent dedup keys.** Each transcript line carries exactly ONE content block, and whole messages are re-emitted non-consecutively, so one key cannot serve all three metrics:
-  - **Tokens** -> `hash(message.id)`. The usage object is repeated identically on every block line. `requestId` is absent on 18 observed records and must never form part of this key. Undeduped output tokens inflate **4.70x** (98.5M vs 20.9M actual).
+  - **Tokens** -> `hash(message.id)`, taking the **per-field maximum** across copies. Copies are NOT identical: for 13,982 of 45,873 messages (30%) the first copy is written mid-stream with a partial `output_tokens` and a later block carries the true total (first block is `thinking` in 28,601 cases). Undeduped inflates **2.56x** (98.5M raw vs 38.6M actual); **first-wins undercounts by 45%** (21.2M vs 38.6M) and looks plausible, which is worse. `requestId` is absent on 18 records and must never form part of this key.
   - **Tool calls** -> `hash(tool_use block id)`. Globally 68,492 raw blocks vs 54,229 distinct ids. Using `message.id` here would undercount 3x (527 vs 1,907 in one measured file).
   - **User messages** -> `hash(uuid)`. 72,443 raw vs 57,122 distinct (1.27x).
+  - **Tool-result echoes are not messages.** 68,600 of 70,308 array-content user records contain only `tool_result` blocks; counting them reports ~100k messages/month against legacy days of ~25.
   These are correctness, not optimization.
 - **Never write to `~/.claude` in Phase 1.** It is read-only. Our cache lives under the app data dir only.
 - **Do not enable macOS App Sandbox.** It breaks reading `~/.claude` and (in Phase 3) signalling processes.
@@ -65,7 +66,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `TokenCounts` (with `add`, `usage_fingerprint`, `billable_total`), `DayRollup`, `SessionRollup`, `AgentRollup`, `FileCursor`, `FileEntry`, `UsageCache`, `SCHEMA_VERSION`.
+- Produces: `TokenCounts` (with `add`, `raise_to`, `is_empty`, `billable_total`), `DayRollup`, `SessionRollup`, `AgentRollup`, `FileCursor`, `FileEntry`, `UsageCache`, `SCHEMA_VERSION`.
 
 - [ ] **Step 1: Add the chrono dependency**
 
@@ -119,11 +120,34 @@ mod tests {
     }
 
     #[test]
-    fn usage_fingerprint_differs_when_any_field_differs() {
-        let a = TokenCounts { input: 1, ..Default::default() };
-        let b = TokenCounts { input: 2, ..Default::default() };
-        assert_ne!(a.usage_fingerprint(), b.usage_fingerprint());
-        assert_eq!(a.usage_fingerprint(), a.clone().usage_fingerprint());
+    fn raise_to_returns_only_the_positive_per_field_delta() {
+        // The real case: a message first seen mid-stream with output 7, then
+        // re-emitted complete with output 156. We must credit the extra 149,
+        // not 156 and not 7.
+        let mut credited = TokenCounts { input: 2, output: 7, cache_read: 100, ..Default::default() };
+        let complete = TokenCounts { input: 2, output: 156, cache_read: 100, ..Default::default() };
+
+        let delta = credited.raise_to(&complete).expect("a delta");
+        assert_eq!(delta.output, 149);
+        assert_eq!(delta.input, 0);
+        assert_eq!(delta.cache_read, 0);
+        // credited is now the per-field max.
+        assert_eq!(credited.output, 156);
+    }
+
+    #[test]
+    fn raise_to_returns_none_when_a_copy_adds_nothing() {
+        let mut credited = TokenCounts { output: 156, ..Default::default() };
+        // An identical copy, and a smaller one, both add nothing.
+        assert!(credited.raise_to(&TokenCounts { output: 156, ..Default::default() }).is_none());
+        assert!(credited.raise_to(&TokenCounts { output: 7, ..Default::default() }).is_none());
+        assert_eq!(credited.output, 156, "must never be lowered");
+    }
+
+    #[test]
+    fn is_empty_detects_a_zero_usage_block() {
+        assert!(TokenCounts::default().is_empty());
+        assert!(!TokenCounts { thinking: 1, ..Default::default() }.is_empty());
     }
 
     #[test]
@@ -131,7 +155,7 @@ mod tests {
         let mut cache = UsageCache::new(420);
         let mut entry = FileEntry::default();
         entry.session.session_id = "s1".to_string();
-        entry.seen.insert(7u64, 99u64);
+        entry.seen.insert(7u64, TokenCounts { output: 99, ..Default::default() });
         entry.seen_tools.insert(11u64);
         entry.seen_users.insert(13u64);
         entry.days.insert("2026-09-10".to_string(), DayRollup::default());
@@ -144,7 +168,7 @@ mod tests {
         assert_eq!(back.tz_offset_minutes, 420);
         let e = back.files.get(std::path::Path::new("/tmp/a.jsonl")).expect("entry");
         assert_eq!(e.session.session_id, "s1");
-        assert_eq!(e.seen.get(&7), Some(&99));
+        assert_eq!(e.seen.get(&7).expect("credited").output, 99);
         assert!(e.seen_tools.contains(&11));
         assert!(e.seen_users.contains(&13));
         assert!(e.days.contains_key("2026-09-10"));
@@ -207,19 +231,37 @@ impl TokenCounts {
         self.input + self.output + self.cache_read + self.cache_creation
     }
 
-    /// Cheap 64-bit fingerprint, used to detect divergent duplicate copies of
-    /// the same message.id without storing full counts per id.
-    pub fn usage_fingerprint(&self) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for v in [
-            self.input, self.output, self.cache_read, self.cache_creation,
-            self.cache_1h, self.cache_5m, self.thinking,
-            self.web_search, self.web_fetch,
-        ] {
-            h ^= v;
-            h = h.wrapping_mul(0x100000001b3);
+    pub fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0
+            && self.cache_creation == 0 && self.cache_1h == 0 && self.cache_5m == 0
+            && self.thinking == 0 && self.web_search == 0 && self.web_fetch == 0
+    }
+
+    /// Raise every field of `self` to at least the matching field of `other`,
+    /// returning the positive delta that was applied, or None if `other` adds
+    /// nothing. This is how duplicate copies of one message.id are folded in:
+    /// early copies are written mid-stream with partial counts, so the correct
+    /// total is the per-field max, and only the delta may be added to rollups.
+    pub fn raise_to(&mut self, other: &TokenCounts) -> Option<TokenCounts> {
+        fn bump(cur: &mut u64, new: u64, delta: &mut u64, any: &mut bool) {
+            if new > *cur {
+                *delta = new - *cur;
+                *cur = new;
+                *any = true;
+            }
         }
-        h
+        let mut d = TokenCounts::default();
+        let mut any = false;
+        bump(&mut self.input, other.input, &mut d.input, &mut any);
+        bump(&mut self.output, other.output, &mut d.output, &mut any);
+        bump(&mut self.cache_read, other.cache_read, &mut d.cache_read, &mut any);
+        bump(&mut self.cache_creation, other.cache_creation, &mut d.cache_creation, &mut any);
+        bump(&mut self.cache_1h, other.cache_1h, &mut d.cache_1h, &mut any);
+        bump(&mut self.cache_5m, other.cache_5m, &mut d.cache_5m, &mut any);
+        bump(&mut self.thinking, other.thinking, &mut d.thinking, &mut any);
+        bump(&mut self.web_search, other.web_search, &mut d.web_search, &mut any);
+        bump(&mut self.web_fetch, other.web_fetch, &mut d.web_fetch, &mut any);
+        if any { Some(d) } else { None }
     }
 }
 
@@ -266,8 +308,9 @@ pub struct FileCursor {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub cursor: FileCursor,
-    /// hash(message.id) -> usage fingerprint. Token dedup. Cleared when retired.
-    pub seen: HashMap<u64, u64>,
+    /// hash(message.id) -> usage credited so far. Token dedup by per-field max:
+    /// a later copy contributes only its positive delta. Cleared when retired.
+    pub seen: HashMap<u64, TokenCounts>,
     /// hash(tool_use block id). Tool-call dedup: each transcript line carries
     /// exactly ONE content block, and blocks repeat via whole-message
     /// re-emission, so message.id cannot serve as the key here.
@@ -283,8 +326,9 @@ pub struct FileEntry {
     pub session: SessionRollup,
     pub agents: HashMap<String, AgentRollup>,
     pub malformed_lines: u64,
-    /// Duplicate copies of one message.id whose usage disagreed. Diagnostic.
-    pub divergent_copies: u64,
+    /// Messages whose totals were revised upward by a later copy. Expect this
+    /// to be large (~30% of messages); it is normal, not an error.
+    pub revised_messages: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,7 +379,7 @@ and add `pub mod legacy;` to `usage/mod.rs`.
 cd src-tauri && cargo test usage:: 2>&1 | tail -15
 ```
 
-Expected: `test result: ok. 4 passed`.
+Expected: `test result: ok. 6 passed`.
 
 - [ ] **Step 6: Verify nothing else regressed**
 
@@ -633,7 +677,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_user_record_for_message_counting() {
+    fn parses_user_record_with_string_content() {
+        // Every typed human prompt has `content` as a STRING, not an array
+        // (2,243 observed). A Vec-only wire type rejects all of them.
         let line = r#"{"type":"user","timestamp":"2026-09-10T08:30:00Z","sessionId":"s","message":{"role":"user","content":"hello"}}"#;
         let rec = match parse_line(line) {
             ParseOutcome::Record(r) => r,
@@ -641,6 +687,29 @@ mod tests {
         };
         assert_eq!(rec.kind, RecordKind::User);
         assert!(rec.usage.is_none());
+        assert!(!rec.is_tool_result_echo);
+    }
+
+    #[test]
+    fn flags_a_user_record_that_is_only_tool_results() {
+        // 68,600 of 70,308 array-content user records are tool-result echoes.
+        // They are transport, not messages.
+        let line = r#"{"type":"user","timestamp":"2026-09-10T08:30:00Z","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a"}]}}"#;
+        let rec = match parse_line(line) {
+            ParseOutcome::Record(r) => r,
+            other => panic!("expected Record, got {:?}", other),
+        };
+        assert!(rec.is_tool_result_echo);
+    }
+
+    #[test]
+    fn a_user_record_mixing_text_with_tool_results_is_a_real_message() {
+        let line = r#"{"type":"user","timestamp":"2026-09-10T08:30:00Z","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t"},{"type":"text","text":"and also"}]}}"#;
+        let rec = match parse_line(line) {
+            ParseOutcome::Record(r) => r,
+            other => panic!("expected Record, got {:?}", other),
+        };
+        assert!(!rec.is_tool_result_echo);
     }
 
     #[test]
@@ -717,6 +786,9 @@ pub struct ParsedRecord {
     /// ids of tool_use blocks on this line. Dedup key for tool calls: each
     /// line carries exactly ONE content block, so message.id cannot serve.
     pub tool_use_ids: Vec<String>,
+    /// True when content is a non-empty array of only `tool_result` blocks:
+    /// a tool-result echo, not a human message.
+    pub is_tool_result_echo: bool,
     /// None for user/other records, for assistant records with no usage
     /// block, and for `<synthetic>` models.
     pub usage: Option<TokenCounts>,
@@ -755,9 +827,18 @@ struct RawLine {
 struct RawMessage {
     id: Option<String>,
     model: Option<String>,
+    /// User prompts carry a STRING here; assistant records carry an array.
+    /// Untagged so either shape parses instead of failing the whole line.
     #[serde(default)]
-    content: Vec<RawBlock>,
+    content: Option<RawContent>,
     usage: Option<RawUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawContent {
+    Text(String),
+    Blocks(Vec<RawBlock>),
 }
 
 #[derive(Deserialize)]
@@ -768,16 +849,19 @@ struct RawBlock {
     id: Option<String>,
 }
 
+/// Every count is Option: `#[serde(default)]` alone tolerates a MISSING key
+/// but an explicit `null` would still fail the whole line, contradicting the
+/// "missing field means skip the record, never fail" constraint.
 #[derive(Deserialize)]
 struct RawUsage {
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    output_tokens: u64,
+    output_tokens: Option<u64>,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    cache_creation_input_tokens: Option<u64>,
     cache_creation: Option<RawCacheCreation>,
     output_tokens_details: Option<RawOutputDetails>,
     server_tool_use: Option<RawServerToolUse>,
@@ -786,56 +870,56 @@ struct RawUsage {
 #[derive(Deserialize)]
 struct RawCacheCreation {
     #[serde(default)]
-    ephemeral_1h_input_tokens: u64,
+    ephemeral_1h_input_tokens: Option<u64>,
     #[serde(default)]
-    ephemeral_5m_input_tokens: u64,
+    ephemeral_5m_input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct RawOutputDetails {
     #[serde(default)]
-    thinking_tokens: u64,
+    thinking_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct RawServerToolUse {
     #[serde(default)]
-    web_search_requests: u64,
+    web_search_requests: Option<u64>,
     #[serde(default)]
-    web_fetch_requests: u64,
+    web_fetch_requests: Option<u64>,
 }
 
 impl RawUsage {
     fn to_counts(&self) -> TokenCounts {
         TokenCounts {
-            input: self.input_tokens,
-            output: self.output_tokens,
-            cache_read: self.cache_read_input_tokens,
-            cache_creation: self.cache_creation_input_tokens,
+            input: self.input_tokens.unwrap_or(0),
+            output: self.output_tokens.unwrap_or(0),
+            cache_read: self.cache_read_input_tokens.unwrap_or(0),
+            cache_creation: self.cache_creation_input_tokens.unwrap_or(0),
             cache_1h: self
                 .cache_creation
                 .as_ref()
-                .map(|c| c.ephemeral_1h_input_tokens)
+                .and_then(|c| c.ephemeral_1h_input_tokens)
                 .unwrap_or(0),
             cache_5m: self
                 .cache_creation
                 .as_ref()
-                .map(|c| c.ephemeral_5m_input_tokens)
+                .and_then(|c| c.ephemeral_5m_input_tokens)
                 .unwrap_or(0),
             thinking: self
                 .output_tokens_details
                 .as_ref()
-                .map(|d| d.thinking_tokens)
+                .and_then(|d| d.thinking_tokens)
                 .unwrap_or(0),
             web_search: self
                 .server_tool_use
                 .as_ref()
-                .map(|s| s.web_search_requests)
+                .and_then(|s| s.web_search_requests)
                 .unwrap_or(0),
             web_fetch: self
                 .server_tool_use
                 .as_ref()
-                .map(|s| s.web_fetch_requests)
+                .and_then(|s| s.web_fetch_requests)
                 .unwrap_or(0),
         }
     }
@@ -869,16 +953,21 @@ pub fn parse_line(line: &str) -> ParseOutcome {
     let model = msg.as_ref().and_then(|m| m.model.clone());
     let message_id = msg.as_ref().and_then(|m| m.id.clone());
 
-    let tool_use_ids: Vec<String> = msg
-        .as_ref()
-        .map(|m| {
-            m.content
-                .iter()
-                .filter(|b| b.kind.as_deref() == Some("tool_use"))
-                .filter_map(|b| b.id.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let blocks: &[RawBlock] = match msg.as_ref().and_then(|m| m.content.as_ref()) {
+        Some(RawContent::Blocks(b)) => b.as_slice(),
+        _ => &[],
+    };
+
+    let tool_use_ids: Vec<String> = blocks
+        .iter()
+        .filter(|b| b.kind.as_deref() == Some("tool_use"))
+        .filter_map(|b| b.id.clone())
+        .collect();
+
+    let is_tool_result_echo = !blocks.is_empty()
+        && blocks
+            .iter()
+            .all(|b| b.kind.as_deref() == Some("tool_result"));
 
     let usage = if kind == RecordKind::Assistant && model.as_deref() != Some(SYNTHETIC_MODEL) {
         msg.as_ref().and_then(|m| m.usage.as_ref()).map(|u| u.to_counts())
@@ -898,6 +987,7 @@ pub fn parse_line(line: &str) -> ParseOutcome {
         model,
         uuid: raw.uuid,
         tool_use_ids,
+        is_tool_result_echo,
         usage,
     })
 }
@@ -911,7 +1001,7 @@ Add `pub mod record;` to `src-tauri/src/usage/mod.rs`.
 cd src-tauri && cargo test usage::record 2>&1 | tail -15
 ```
 
-Expected: `test result: ok. 11 passed`.
+Expected: `test result: ok. 13 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -933,9 +1023,13 @@ This is the task the whole plan exists for. Get it wrong and every number the ap
 
 **Interfaces:**
 - Consumes: `FileEntry`, `TokenCounts`, `DayRollup` (Task 1); `date_key_with_offset` (Task 2); `parse_line`, `ParseOutcome`, `RecordKind` (Task 3).
-- Produces: `key_hash(&str) -> u64`, `IngestStats { records: u64, malformed: u64, deduped: u64 }`, `ingest_text(&mut FileEntry, &str, i32) -> IngestStats`.
+- Produces: `key_hash(&str) -> u64`, `IngestStats { records: u64, malformed: u64, deduped: u64 }`, `ingest_line(&mut FileEntry, &str, i32, &mut IngestStats)`, `ingest_text(&mut FileEntry, &str, i32) -> IngestStats`.
 
-**Design note for the implementer:** an earlier review suggested taking the max per field across duplicate copies of a message. That would require storing full `TokenCounts` per message id (~45,700 entries), several times the memory of a fingerprint. Since copies are identical in observed data, this uses **first-wins** plus a cheap fingerprint comparison that increments `divergent_copies` when copies disagree. That surfaces divergence as a visible diagnostic instead of paying for it up front. If `divergent_copies` turns out non-zero in the field, revisit with evidence.
+`ingest_line` is the real entry point: Task 11 streams a transcript line by line into it, so a 95 MB file is never held in memory. `ingest_text` is a thin loop over it, kept because it makes every test in this task readable.
+
+**Design note for the implementer — read this before writing any code.** Duplicate copies of one `message.id` are **not** identical. For 30% of messages (13,982 of 45,873) the first copy is written while the response is still streaming and carries a *partial* `output_tokens`; a later copy carries the true total. The first block seen is `thinking` in 28,601 cases. One measured message went 7 -> 156.
+
+So dedup takes the **per-field maximum**: `entry.seen` stores the counts credited so far for each message id, and a later copy contributes only its positive delta. Taking the first copy instead loses **45% of all output tokens** (21.2M vs 38.6M actual) while producing numbers that look entirely plausible — which is exactly why this is tested rather than eyeballed.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -967,7 +1061,7 @@ mod tests {
 
     #[test]
     fn identical_blocks_of_one_message_count_tokens_once() {
-        // The 4.70x inflation regression test. Three block-lines, one message.
+        // Inflation regression: three block-lines, one message, equal usage.
         let text = format!(
             "{}\n{}\n{}\n",
             assistant_line("msg_1", "thinking", 894),
@@ -1014,16 +1108,53 @@ mod tests {
     }
 
     #[test]
-    fn divergent_duplicate_is_counted_as_a_diagnostic_not_added() {
+    fn a_later_larger_copy_revises_the_total_upward() {
+        // THE regression test for the 45% undercount. The mid-stream copy
+        // reports 7 output tokens; the complete copy reports 156.
         let text = format!(
             "{}\n{}\n",
-            assistant_line("msg_1", "text", 100),
-            assistant_line("msg_1", "text", 999), // same id, different usage
+            assistant_line("msg_1", "thinking", 7),
+            assistant_line("msg_1", "text", 156),
         );
         let mut entry = FileEntry::default();
         ingest_text(&mut entry, &text, 0);
-        assert_eq!(entry.divergent_copies, 1);
-        assert_eq!(entry.days["2026-09-10"].by_model["claude-opus-5"].output, 100);
+
+        assert_eq!(
+            entry.days["2026-09-10"].by_model["claude-opus-5"].output, 156,
+            "must be the max (156), not the first (7) and not the sum (163)"
+        );
+        assert_eq!(entry.revised_messages, 1);
+        assert_eq!(entry.days["2026-09-10"].message_count, 1, "one message, two lines");
+    }
+
+    #[test]
+    fn a_smaller_later_copy_never_lowers_the_total() {
+        let text = format!(
+            "{}\n{}\n",
+            assistant_line("msg_1", "text", 156),
+            assistant_line("msg_1", "thinking", 7),
+        );
+        let mut entry = FileEntry::default();
+        ingest_text(&mut entry, &text, 0);
+        assert_eq!(entry.days["2026-09-10"].by_model["claude-opus-5"].output, 156);
+        assert_eq!(entry.revised_messages, 0);
+    }
+
+    #[test]
+    fn revision_straddling_two_passes_still_reaches_the_max() {
+        let mut entry = FileEntry::default();
+        ingest_text(&mut entry, &format!("{}\n", assistant_line("msg_1", "thinking", 7)), 0);
+        ingest_text(&mut entry, &format!("{}\n", assistant_line("msg_1", "text", 156)), 0);
+        assert_eq!(entry.days["2026-09-10"].by_model["claude-opus-5"].output, 156);
+    }
+
+    #[test]
+    fn tool_result_echoes_are_not_counted_as_messages() {
+        let echo = r#"{"type":"user","uuid":"u-1","timestamp":"2026-09-10T08:30:00Z","sessionId":"s-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a"}]}}"#;
+        let prompt = r#"{"type":"user","uuid":"u-2","timestamp":"2026-09-10T08:31:00Z","sessionId":"s-1","message":{"role":"user","content":"a real prompt"}}"#;
+        let mut entry = FileEntry::default();
+        ingest_text(&mut entry, &format!("{}\n{}\n", echo, prompt), 0);
+        assert_eq!(entry.days["2026-09-10"].message_count, 1, "only the prompt counts");
     }
 
     #[test]
@@ -1100,7 +1231,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_counted_and_do_not_abort_ingest() {
         let text = format!(
-            "{}\n{not json\n{}\n",
+            "{}\n{{not json\n{}\n",
             assistant_line("msg_1", "text", 10),
             assistant_line("msg_2", "text", 20),
         );
@@ -1168,25 +1299,33 @@ pub fn key_hash(s: &str) -> u64 {
     h
 }
 
-/// Apply every complete line in `text` to `entry`. Callers must pass only
-/// complete lines (see cursor::split_complete_lines).
+/// Apply one complete transcript line to `entry`. This is what the scanner
+/// streams into, so no whole file is ever buffered.
+pub fn ingest_line(
+    entry: &mut FileEntry,
+    line: &str,
+    tz_offset_minutes: i32,
+    stats: &mut IngestStats,
+) {
+    let rec = match parse_line(line) {
+        ParseOutcome::Record(r) => r,
+        ParseOutcome::Skipped => return,
+        ParseOutcome::Malformed => {
+            stats.malformed += 1;
+            entry.malformed_lines += 1;
+            return;
+        }
+    };
+    stats.records += 1;
+    apply_record(entry, &rec, tz_offset_minutes, stats);
+}
+
+/// Convenience loop over `ingest_line`, used by tests.
 pub fn ingest_text(entry: &mut FileEntry, text: &str, tz_offset_minutes: i32) -> IngestStats {
     let mut stats = IngestStats::default();
-
     for line in text.lines() {
-        let rec = match parse_line(line) {
-            ParseOutcome::Record(r) => r,
-            ParseOutcome::Skipped => continue,
-            ParseOutcome::Malformed => {
-                stats.malformed += 1;
-                entry.malformed_lines += 1;
-                continue;
-            }
-        };
-        stats.records += 1;
-        apply_record(entry, &rec, tz_offset_minutes, &mut stats);
+        ingest_line(entry, line, tz_offset_minutes, &mut stats);
     }
-
     stats
 }
 
@@ -1225,14 +1364,19 @@ fn apply_record(
         }
     }
 
-    // --- User messages: dedupe on uuid ---
+    // --- User messages: dedupe on uuid, skipping tool-result echoes ---
     if rec.kind == RecordKind::User {
-        let counts = match &rec.uuid {
+        // Echoes are transport, not messages. Their timestamp already
+        // contributed to last_ts above, which is all they are good for.
+        if rec.is_tool_result_echo {
+            return;
+        }
+        let is_new = match &rec.uuid {
             Some(u) => entry.seen_users.insert(key_hash(u)),
             // No uuid: cannot dedupe, count it rather than silently drop it.
             None => true,
         };
-        if counts {
+        if is_new {
             day.message_count += 1;
             entry.session.message_count += 1;
         }
@@ -1247,42 +1391,46 @@ fn apply_record(
         return;
     };
     let id_hash = key_hash(msg_id);
+    let usage = rec.usage.clone().unwrap_or_default();
 
-    if let Some(&existing_fp) = entry.seen.get(&id_hash) {
+    // Decide what this copy contributes. A first sighting credits its whole
+    // usage; a repeat credits only the amount by which it EXCEEDS what we
+    // already credited, because early copies are written mid-stream with
+    // partial counts. The borrow of `entry.seen` ends before the match body
+    // touches other fields.
+    let seen_before = entry.seen.contains_key(&id_hash);
+    let to_apply = if seen_before {
         stats.deduped += 1;
-        let fp = rec
-            .usage
-            .as_ref()
-            .map(|u| u.usage_fingerprint())
-            .unwrap_or(0);
-        if fp != 0 && fp != existing_fp {
-            entry.divergent_copies += 1;
+        let delta = entry
+            .seen
+            .get_mut(&id_hash)
+            .and_then(|credited| credited.raise_to(&usage));
+        if delta.is_some() {
+            entry.revised_messages += 1;
         }
+        delta
+    } else {
+        entry.seen.insert(id_hash, usage.clone());
+        day.message_count += 1;
+        entry.session.message_count += 1;
+        Some(usage)
+    };
+
+    let Some(counts) = to_apply else {
+        return;
+    };
+    if counts.is_empty() {
         return;
     }
 
-    let fp = rec
-        .usage
-        .as_ref()
-        .map(|u| u.usage_fingerprint())
-        .unwrap_or(0);
-    entry.seen.insert(id_hash, fp);
-
-    day.message_count += 1;
-    entry.session.message_count += 1;
-
-    let Some(usage) = rec.usage.as_ref() else {
-        return;
-    };
     let model = rec.model.clone().unwrap_or_else(|| "unknown".to_string());
-
-    day.by_model.entry(model.clone()).or_default().add(usage);
+    day.by_model.entry(model.clone()).or_default().add(&counts);
     entry
         .session
         .by_model
         .entry(model)
         .or_default()
-        .add(usage);
+        .add(&counts);
 
     if rec.ts_ms > entry.session.last_usage_ts {
         entry.session.last_usage_ts = rec.ts_ms;
@@ -1302,7 +1450,7 @@ fn apply_record(
         if rec.ts_ms > agent.last_ts {
             agent.last_ts = rec.ts_ms;
         }
-        agent.tokens.add(usage);
+        agent.tokens.add(&counts);
     }
 }
 ```
@@ -1315,7 +1463,7 @@ Add `pub mod ingest;` to `src-tauri/src/usage/mod.rs`.
 cd src-tauri && cargo test usage::ingest 2>&1 | tail -20
 ```
 
-Expected: `test result: ok. 12 passed`.
+Expected: `test result: ok. 15 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1323,10 +1471,14 @@ Expected: `test result: ok. 12 passed`.
 git add src-tauri/src/usage/ingest.rs src-tauri/src/usage/mod.rs
 git commit -m "feat(usage): deduplicated ingest with three independent keys
 
-Tokens dedupe on message.id, tool calls on tool_use block id, user
-messages on uuid. Each transcript line carries one content block and
-messages are re-emitted, so a single key cannot serve all three.
-Regression test pins the 4.70x token inflation at 1x."
+Tokens dedupe on message.id taking the per-field maximum, tool calls on
+tool_use block id, user messages on uuid. Each transcript line carries
+one content block and messages are re-emitted, so a single key cannot
+serve all three.
+
+The max matters: early copies are written mid-stream with partial
+output_tokens, so first-wins loses 45% of output tokens (21.2M vs 38.6M
+actual). Tool-result echoes are excluded from message counts."
 ```
 
 ---
@@ -1340,7 +1492,9 @@ Regression test pins the 4.70x token inflation at 1x."
 
 **Interfaces:**
 - Consumes: `FileCursor` (Task 1).
-- Produces: `FileMeta { size, mtime_ms, inode }`, `ScanAction`, `decide(Option<&FileCursor>, Option<&FileMeta>) -> ScanAction`, `split_complete_lines(&str) -> (&str, usize)`, `read_meta(&Path) -> Option<FileMeta>`, `read_range(&Path, u64) -> Result<(String, u64), String>`.
+- Produces: `FileMeta { size, mtime_ms, inode }`, `ScanAction`, `decide(Option<&FileCursor>, Option<&FileMeta>) -> ScanAction`, `read_meta(&Path) -> Option<FileMeta>`, `stream_lines_from(&Path, u64, impl FnMut(&str)) -> Result<u64, String>`.
+
+`stream_lines_from` hands out one complete line at a time and returns the byte count consumed. It deliberately does NOT return the file's text: the largest observed transcript is 95 MB, and buffering it (plus a lossy UTF-8 copy) would peak near 190 MB on every full ingest.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1409,31 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn split_complete_lines_withholds_a_partial_trailing_record() {
-        let buf = "{\"a\":1}\n{\"b\":2}\n{\"c\":pa";
-        let (complete, consumed) = split_complete_lines(buf);
-        assert_eq!(complete, "{\"a\":1}\n{\"b\":2}\n");
-        assert_eq!(consumed, 16);
-    }
-
-    #[test]
-    fn split_complete_lines_handles_exact_newline_ending() {
-        let buf = "{\"a\":1}\n";
-        let (complete, consumed) = split_complete_lines(buf);
-        assert_eq!(complete, "{\"a\":1}\n");
-        assert_eq!(consumed, 8);
-    }
-
-    #[test]
-    fn split_complete_lines_withholds_everything_when_no_newline_yet() {
-        let buf = "{\"a\":partial";
-        let (complete, consumed) = split_complete_lines(buf);
-        assert_eq!(complete, "");
-        assert_eq!(consumed, 0);
-    }
-
-    #[test]
-    fn read_range_returns_only_bytes_after_offset() {
+    fn streams_only_lines_after_the_offset() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.jsonl");
         let mut f = std::fs::File::create(&path).expect("create");
@@ -1441,22 +1571,53 @@ mod tests {
         writeln!(f, "{{\"b\":2}}").expect("write");
         f.flush().expect("flush");
 
-        let (text, consumed) = read_range(&path, 8).expect("read");
-        assert_eq!(text, "{\"b\":2}\n");
+        let mut got = Vec::new();
+        // First line is 8 bytes including its newline.
+        let consumed = stream_lines_from(&path, 8, |l| got.push(l.to_string())).expect("read");
+        assert_eq!(got, vec!["{\"b\":2}".to_string()]);
         assert_eq!(consumed, 8);
     }
 
     #[test]
-    fn read_range_withholds_a_half_written_trailing_line() {
+    fn streams_lines_one_at_a_time_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        writeln!(f, "one").expect("write");
+        writeln!(f, "two").expect("write");
+        writeln!(f, "three").expect("write");
+        f.flush().expect("flush");
+
+        let mut got = Vec::new();
+        let consumed = stream_lines_from(&path, 0, |l| got.push(l.to_string())).expect("read");
+        assert_eq!(got, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+        assert_eq!(consumed, 14); // 4 + 4 + 6
+    }
+
+    #[test]
+    fn withholds_a_half_written_trailing_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.jsonl");
         let mut f = std::fs::File::create(&path).expect("create");
         write!(f, "{{\"a\":1}}\n{{\"b\":par").expect("write");
         f.flush().expect("flush");
 
-        let (text, consumed) = read_range(&path, 0).expect("read");
-        assert_eq!(text, "{\"a\":1}\n");
+        let mut got = Vec::new();
+        let consumed = stream_lines_from(&path, 0, |l| got.push(l.to_string())).expect("read");
+        assert_eq!(got, vec!["{\"a\":1}".to_string()], "partial line must be withheld");
         assert_eq!(consumed, 8, "offset must not advance past the partial line");
+    }
+
+    #[test]
+    fn streaming_a_file_with_no_complete_line_consumes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, b"{\"a\":partial").expect("write");
+
+        let mut got = Vec::new();
+        let consumed = stream_lines_from(&path, 0, |l| got.push(l.to_string())).expect("read");
+        assert!(got.is_empty());
+        assert_eq!(consumed, 0);
     }
 
     #[test]
@@ -1486,7 +1647,7 @@ Prepend to `src-tauri/src/usage/cursor.rs`:
 
 ```rust
 use crate::usage::types::FileCursor;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1532,19 +1693,6 @@ pub fn decide(cursor: Option<&FileCursor>, meta: Option<&FileMeta>) -> ScanActio
     }
 }
 
-/// Split a buffer into the portion ending at its last newline and the byte
-/// count that portion occupies. A trailing partial record is withheld so it is
-/// re-read intact on the next pass.
-pub fn split_complete_lines(buf: &str) -> (&str, usize) {
-    match buf.rfind('\n') {
-        Some(idx) => {
-            let end = idx + 1;
-            (&buf[..end], end)
-        }
-        None => ("", 0),
-    }
-}
-
 pub fn read_meta(path: &Path) -> Option<FileMeta> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(path).ok()?;
@@ -1561,30 +1709,45 @@ pub fn read_meta(path: &Path) -> Option<FileMeta> {
     })
 }
 
-/// Read from `offset` to EOF, returning complete lines only plus the number of
-/// bytes consumed. Streams via BufReader; never loads a whole 95 MB file.
-pub fn read_range(path: &Path, offset: u64) -> Result<(String, u64), String> {
+/// Stream complete lines from `offset` to EOF, calling `on_line` for each and
+/// returning the number of bytes consumed. A trailing partial line (a live
+/// session mid-write) is withheld so it is re-read intact next pass.
+///
+/// Only one line is buffered at a time: the largest observed transcript is
+/// 95 MB, and holding it plus a UTF-8 copy would peak near 190 MB.
+pub fn stream_lines_from(
+    path: &Path,
+    offset: u64,
+    mut on_line: impl FnMut(&str),
+) -> Result<u64, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {:?}: {}", path, e))?;
     let mut reader = BufReader::new(file);
     reader
         .seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek {:?}: {}", path, e))?;
 
-    let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read {:?}: {}", path, e))?;
+    let mut consumed: u64 = 0;
+    let mut buf: Vec<u8> = Vec::new();
 
-    // Transcripts are UTF-8; a lossy conversion keeps a corrupt byte from
-    // aborting the whole pass. Byte counts stay correct because we measure
-    // against the raw buffer via the newline position.
-    let last_newline = buf.iter().rposition(|b| *b == b'\n');
-    let consumed = match last_newline {
-        Some(i) => i as u64 + 1,
-        None => 0,
-    };
-    let text = String::from_utf8_lossy(&buf[..consumed as usize]).into_owned();
-    Ok((text, consumed))
+    loop {
+        buf.clear();
+        let read = reader
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| format!("read {:?}: {}", path, e))?;
+        if read == 0 {
+            break; // EOF
+        }
+        if buf.last() != Some(&b'\n') {
+            break; // partial trailing line: withhold it
+        }
+        consumed += read as u64;
+        // Lossy so one corrupt byte cannot abort the whole pass; the line is
+        // then very likely counted as malformed downstream, which is correct.
+        let line = String::from_utf8_lossy(&buf[..read - 1]);
+        on_line(line.as_ref());
+    }
+
+    Ok(consumed)
 }
 ```
 
@@ -1596,13 +1759,13 @@ Add `pub mod cursor;` to `src-tauri/src/usage/mod.rs`.
 cd src-tauri && cargo test usage::cursor 2>&1 | tail -20
 ```
 
-Expected: `test result: ok. 13 passed`.
+Expected: `test result: ok. 12 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src-tauri/src/usage/cursor.rs src-tauri/src/usage/mod.rs
-git commit -m "feat(usage): cursor scan decisions and partial-line safe reads"
+git commit -m "feat(usage): cursor scan decisions and line-streaming reads"
 ```
 
 ---
@@ -1692,7 +1855,7 @@ Expected: compile error, `cannot find function discover_transcripts`.
 Prepend to `src-tauri/src/usage/discovery.rs`:
 
 ```rust
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Every `*.jsonl` under `projects_root`, at any depth. Deliberately NOT
 /// pattern-matched on path shape: subagent transcripts nest under
@@ -1830,6 +1993,42 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_preserves_retired_history_it_cannot_re_derive() {
+        // Retired entries describe transcripts upstream has already deleted.
+        // A schema bump or timezone change must NOT discard them, or the
+        // cache's whole purpose as a long-term record is defeated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("usage-cache.v1.json");
+
+        let mut c = UsageCache::new(420);
+        let mut live = FileEntry::default();
+        live.session.session_id = "live".to_string();
+        let mut gone = FileEntry::default();
+        gone.session.session_id = "gone".to_string();
+        gone.retired = true;
+        gone.days.insert("2026-08-01".to_string(), Default::default());
+        c.files.insert("/live.jsonl".into(), live);
+        c.files.insert("/gone.jsonl".into(), gone);
+        c.schema = SCHEMA_VERSION + 1; // force a schema rebuild
+        std::fs::write(&path, serde_json::to_string(&c).expect("ser")).expect("write");
+
+        let salvaged = salvage_retired(&path);
+        assert_eq!(salvaged.len(), 1, "only the retired entry is salvageable");
+        let e = salvaged.get(std::path::Path::new("/gone.jsonl")).expect("retired entry");
+        assert!(e.retired);
+        assert!(e.days.contains_key("2026-08-01"));
+    }
+
+    #[test]
+    fn salvage_returns_empty_for_a_corrupt_or_absent_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(salvage_retired(&dir.path().join("absent.json")).is_empty());
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, b"{ nope").expect("write");
+        assert!(salvage_retired(&bad).is_empty());
+    }
+
+    #[test]
     fn interrupted_write_leaves_the_previous_cache_intact() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("usage-cache.v1.json");
@@ -1866,8 +2065,9 @@ Expected: compile errors, `cannot find function save_atomic`.
 Prepend to `src-tauri/src/usage/store.rs`:
 
 ```rust
-use crate::usage::types::{UsageCache, SCHEMA_VERSION};
-use std::path::Path;
+use crate::usage::types::{FileEntry, UsageCache, SCHEMA_VERSION};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RebuildReason {
@@ -1911,6 +2111,29 @@ pub fn load(path: &Path, current_tz_offset_minutes: i32) -> LoadOutcome {
     LoadOutcome::Loaded(cache)
 }
 
+/// Recover the entries a rebuild cannot re-derive: those whose source
+/// transcript has been pruned upstream. Called before discarding a cache on a
+/// schema or timezone rebuild. Best-effort by design — a corrupt cache yields
+/// nothing, which is the same position we would be in without it.
+///
+/// Note the day keys of salvaged entries were computed under the OLD timezone
+/// offset. Keeping a slightly mis-bucketed month of history beats deleting it.
+pub fn salvage_retired(path: &Path) -> HashMap<PathBuf, FileEntry> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    // Deserialize leniently: we only need the retired entries, and the schema
+    // that failed validation may still parse structurally.
+    let Ok(cache) = serde_json::from_str::<UsageCache>(&contents) else {
+        return HashMap::new();
+    };
+    cache
+        .files
+        .into_iter()
+        .filter(|(_, e)| e.retired)
+        .collect()
+}
+
 /// Write via a temp file plus rename, so an interrupted write can never
 /// replace a good cache with a truncated one.
 pub fn save_atomic(path: &Path, cache: &UsageCache) -> Result<(), String> {
@@ -1934,13 +2157,17 @@ Add `pub mod store;` to `src-tauri/src/usage/mod.rs`.
 cd src-tauri && cargo test usage::store 2>&1 | tail -15
 ```
 
-Expected: `test result: ok. 7 passed`.
+Expected: `test result: ok. 9 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src-tauri/src/usage/store.rs src-tauri/src/usage/mod.rs
-git commit -m "feat(usage): durable cache with atomic writes and self-healing rebuilds"
+git commit -m "feat(usage): durable cache with atomic writes and self-healing rebuilds
+
+Rebuilds salvage retired entries first: those describe transcripts
+upstream has already pruned, so discarding them would lose history the
+cache exists to preserve and cannot re-derive."
 ```
 
 ---
@@ -2679,7 +2906,13 @@ Append this test to the `tests` module inside `src-tauri/src/usage/adapter.rs`:
         let mut cache = UsageCache::new(0);
         cache.files.insert(
             "/a.jsonl".into(),
-            entry_with("s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 4, 2, 100, 200),
+            entry_with(
+                "s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 4, 2,
+                // Real 2026-09-10 timestamps: with first_ts = 100 the live
+                // session's date would be 1970-01-01 and would wrongly win the
+                // earliest-date comparison below.
+                1789029179076, 1789029179076,
+            ),
         );
 
         let mut legacy = LegacyRollup::default();
@@ -2816,7 +3049,11 @@ and in the struct literal:
         total_messages: sessions.values().map(|s| s.message_count).sum::<u64>() + legacy_messages,
 ```
 
-Note: `first_session_date` and `hour_counts` are declared with `let` earlier in the function; change them to `let mut hour_counts` and rebind `first_session_date` as shown so these additions compile.
+**Exact placement:** insert both blocks immediately after the existing
+`for s in sessions.values() { ... }` loop that builds `hour_counts`, and before
+`let last_computed_date = ...`. `hour_counts` is already declared `let mut` in Task 9, so it
+needs no change; `first_session_date` is rebound by the `let` shown above, which shadows the
+earlier binding legally. Then apply the two struct-literal field changes.
 
 - [ ] **Step 8: Run the adapter tests to verify they pass**
 
@@ -2848,8 +3085,8 @@ git commit -m "feat(usage): seed retired stats-cache history and merge it into s
 - Produces:
   - `scanner::ScanReport { files_seen, files_read, files_retired, bytes_read, malformed, deduped }`
   - `scanner::scan_once(&mut UsageCache, &Path, Option<&mut dyn FnMut(usize, usize)>) -> ScanReport`
-  - `worker::UsageWorker`, `worker::UsageWorker::new(ConfigRoots, PathBuf) -> UsageWorker`, `.refresh_now() -> ScanReport`, `.snapshot() -> StatsCache`, `.diagnostics() -> Diagnostics`
-  - `worker::Diagnostics { malformed_lines, divergent_copies, files_tracked, files_retired, last_scan_ms }`
+  - `worker::UsageWorker`, `worker::UsageWorker::new(ConfigRoots, PathBuf) -> UsageWorker`, `.refresh_now() -> ScanReport`, `.refresh_with_progress(...) -> ScanReport`, `.snapshot() -> StatsCache`, `.diagnostics() -> Diagnostics`, `.persist() -> Result<(), String>`, `.maybe_persist() -> Result<bool, String>`
+  - `worker::Diagnostics { malformed_lines, revised_messages, files_tracked, files_retired, last_scan_ms }`
 
 - [ ] **Step 1: Write the failing scanner test**
 
@@ -2997,9 +3234,9 @@ Expected: compile error, `cannot find function scan_once`.
 Prepend to `src-tauri/src/usage/scanner.rs`:
 
 ```rust
-use crate::usage::cursor::{decide, read_meta, read_range, ScanAction};
+use crate::usage::cursor::{decide, read_meta, stream_lines_from, ScanAction};
 use crate::usage::discovery::discover_transcripts;
-use crate::usage::ingest::ingest_text;
+use crate::usage::ingest::{ingest_line, IngestStats};
 use crate::usage::types::{FileEntry, UsageCache};
 use std::collections::HashSet;
 use std::path::Path;
@@ -3034,31 +3271,65 @@ pub fn scan_once(
         let action = decide(cache.files.get(&path).map(|e| &e.cursor), meta.as_ref());
 
         match action {
-            ScanAction::Skip | ScanAction::Retire => {}
-            ScanAction::Full | ScanAction::Delta { .. } => {
-                let from = match action {
-                    ScanAction::Delta { from } => from,
-                    _ => 0,
-                };
-                if matches!(action, ScanAction::Full) {
-                    // Discard any prior contribution before re-ingesting.
-                    cache.files.insert(path.clone(), FileEntry::default());
-                }
-                if let Ok((text, consumed)) = read_range(&path, from) {
-                    let entry = cache.files.entry(path.clone()).or_default();
-                    let stats = ingest_text(entry, &text, tz);
-                    report.malformed += stats.malformed;
-                    report.deduped += stats.deduped;
-                    report.bytes_read += consumed;
-                    report.files_read += 1;
-
-                    if let Some(m) = meta.as_ref() {
-                        entry.cursor.offset = from + consumed;
-                        entry.cursor.size = m.size;
-                        entry.cursor.mtime_ms = m.mtime_ms;
-                        entry.cursor.inode = m.inode;
-                    }
+            ScanAction::Retire => {}
+            ScanAction::Skip => {
+                // A retired file that reappeared unchanged: clear the flag so
+                // diagnostics do not drift.
+                if let Some(entry) = cache.files.get_mut(&path) {
                     entry.retired = false;
+                }
+            }
+            ScanAction::Full => {
+                // Ingest into a FRESH entry and install it only on success, so
+                // a transient read error cannot destroy this file's history.
+                let mut work = FileEntry::default();
+                let mut stats = IngestStats::default();
+                let result = stream_lines_from(&path, 0, |line| {
+                    ingest_line(&mut work, line, tz, &mut stats)
+                });
+                match result {
+                    Ok(consumed) => {
+                        if let Some(m) = meta.as_ref() {
+                            work.cursor.offset = consumed;
+                            work.cursor.size = m.size;
+                            work.cursor.mtime_ms = m.mtime_ms;
+                            work.cursor.inode = m.inode;
+                        }
+                        report.malformed += stats.malformed;
+                        report.deduped += stats.deduped;
+                        report.bytes_read += consumed;
+                        report.files_read += 1;
+                        cache.files.insert(path.clone(), work);
+                    }
+                    Err(e) => eprintln!("[usage] full ingest of {:?} failed: {}", path, e),
+                }
+            }
+            ScanAction::Delta { from } => {
+                // Safe to mutate in place: the cursor advances only on success,
+                // so a mid-stream failure just re-reads the same bytes next
+                // pass, and dedup makes re-application idempotent.
+                let Some(entry) = cache.files.get_mut(&path) else {
+                    continue;
+                };
+                let mut stats = IngestStats::default();
+                let result = stream_lines_from(&path, from, |line| {
+                    ingest_line(entry, line, tz, &mut stats)
+                });
+                match result {
+                    Ok(consumed) => {
+                        if let Some(m) = meta.as_ref() {
+                            entry.cursor.offset = from + consumed;
+                            entry.cursor.size = m.size;
+                            entry.cursor.mtime_ms = m.mtime_ms;
+                            entry.cursor.inode = m.inode;
+                        }
+                        entry.retired = false;
+                        report.malformed += stats.malformed;
+                        report.deduped += stats.deduped;
+                        report.bytes_read += consumed;
+                        report.files_read += 1;
+                    }
+                    Err(e) => eprintln!("[usage] delta ingest of {:?} failed: {}", path, e),
                 }
             }
         }
@@ -3163,7 +3434,36 @@ mod tests {
         assert_eq!(d.files_tracked, 1);
         assert_eq!(d.files_retired, 0);
         assert_eq!(d.malformed_lines, 0);
-        assert_eq!(d.divergent_copies, 0);
+        assert_eq!(d.revised_messages, 0);
+        assert!(d.last_scan_ms > 0, "scan duration must be recorded, not left 0");
+    }
+
+    #[test]
+    fn maybe_persist_writes_once_then_throttles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = setup(dir.path());
+
+        // Nothing scanned yet: nothing to write.
+        assert!(!worker.maybe_persist().expect("no-op"), "clean cache must not write");
+
+        worker.refresh_now();
+        assert!(worker.maybe_persist().expect("first"), "a changed cache must persist");
+        // Immediately after, both the dirty flag and the throttle block a write.
+        assert!(!worker.maybe_persist().expect("second"), "must not rewrite immediately");
+    }
+
+    #[test]
+    fn an_unchanged_rescan_does_not_mark_the_cache_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = setup(dir.path());
+        worker.refresh_now();
+        worker.persist().expect("persist");
+
+        // Second scan reads nothing, so there is nothing new to write. This is
+        // what keeps the 60s fallback poll from rewriting megabytes all day.
+        let report = worker.refresh_now();
+        assert_eq!(report.files_read, 0);
+        assert!(!worker.maybe_persist().expect("no-op"));
     }
 
     #[test]
@@ -3217,17 +3517,25 @@ use crate::usage::types::UsageCache;
 use crate::StatsCache;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostics {
     pub malformed_lines: u64,
-    pub divergent_copies: u64,
+    /// Messages whose totals a later copy revised upward. Expect ~30%.
+    pub revised_messages: u64,
     pub files_tracked: usize,
     pub files_retired: usize,
     pub last_scan_ms: u64,
 }
+
+/// Minimum gap between cache writes. The cache is several MB and transcripts
+/// change many times per second, so an ungated persist would write gigabytes
+/// a day.
+const MIN_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Owns the cache. Every mutation goes through one mutex, so the watcher, the
 /// fallback poll, manual refresh and `get_stats` cannot race or double-count.
@@ -3235,6 +3543,10 @@ pub struct UsageWorker {
     roots: ConfigRoots,
     cache_path: PathBuf,
     cache: Mutex<UsageCache>,
+    /// Set when a scan actually changed something; cleared on persist.
+    dirty: AtomicBool,
+    last_scan_ms: AtomicU64,
+    last_persist: Mutex<Option<Instant>>,
 }
 
 impl UsageWorker {
@@ -3251,7 +3563,14 @@ impl UsageWorker {
         if cache.legacy.is_none() {
             cache.legacy = seed_from_stats_cache(&roots.stats_cache);
         }
-        UsageWorker { roots, cache_path, cache: Mutex::new(cache) }
+        UsageWorker {
+            roots,
+            cache_path,
+            cache: Mutex::new(cache),
+            dirty: AtomicBool::new(false),
+            last_scan_ms: AtomicU64::new(0),
+            last_persist: Mutex::new(None),
+        }
     }
 
     pub fn refresh_now(&self) -> ScanReport {
@@ -3262,10 +3581,16 @@ impl UsageWorker {
         &self,
         progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> ScanReport {
-        let started = std::time::Instant::now();
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let report = scan_once(&mut guard, &self.roots.projects, progress);
-        let _ = started;
+        let started = Instant::now();
+        let report = {
+            let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            scan_once(&mut guard, &self.roots.projects, progress)
+        };
+        self.last_scan_ms
+            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if report.files_read > 0 || report.files_retired > 0 {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
         report
     }
 
@@ -3278,16 +3603,39 @@ impl UsageWorker {
         let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         Diagnostics {
             malformed_lines: guard.files.values().map(|e| e.malformed_lines).sum(),
-            divergent_copies: guard.files.values().map(|e| e.divergent_copies).sum(),
+            revised_messages: guard.files.values().map(|e| e.revised_messages).sum(),
             files_tracked: guard.files.len(),
             files_retired: guard.files.values().filter(|e| e.retired).count(),
-            last_scan_ms: 0,
+            last_scan_ms: self.last_scan_ms.load(Ordering::Relaxed),
         }
     }
 
+    /// Unconditional write. Use on quit and for an explicit user rescan.
     pub fn persist(&self) -> Result<(), String> {
         let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        save_atomic(&self.cache_path, &guard)
+        save_atomic(&self.cache_path, &guard)?;
+        drop(guard);
+        self.dirty.store(false, Ordering::Relaxed);
+        *self.last_persist.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Write only if a scan changed something AND enough time has passed.
+    /// Returns whether a write happened.
+    pub fn maybe_persist(&self) -> Result<bool, String> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        {
+            let last = self.last_persist.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = *last {
+                if t.elapsed() < MIN_PERSIST_INTERVAL {
+                    return Ok(false);
+                }
+            }
+        }
+        self.persist()?;
+        Ok(true)
     }
 }
 ```
@@ -3300,7 +3648,7 @@ Add `pub mod worker;` to `src-tauri/src/usage/mod.rs`.
 cd src-tauri && cargo test usage::worker 2>&1 | tail -15
 ```
 
-Expected: `test result: ok. 4 passed`.
+Expected: `test result: ok. 6 passed`.
 
 - [ ] **Step 9: Commit**
 
@@ -3398,6 +3746,8 @@ async fn refresh_usage(
     worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
 ) -> Result<(), String> {
     worker.refresh_now();
+    // Explicit user action: write immediately rather than waiting for the
+    // throttle window.
     worker.persist()
 }
 ```
@@ -3421,6 +3771,18 @@ pub fn update_tray_from_worker(app: &AppHandle) {
 ```
 
 Keep `read_stats` and `stats_cache_path` — Task 10 uses the old file as the legacy seed, and the existing tests for them stay valid.
+
+**Do not leave the crate broken:** `polling.rs` still calls `crate::update_tray_from_stats` in
+two places (its event branch and its timeout branch). Task 13 rewrites that file, but this task
+must compile on its own, so update both call sites now:
+
+```bash
+cd /Users/nathanaelmcmillan/Projects/claude-token-usage
+sed -i '' 's/crate::update_tray_from_stats(&app)/crate::update_tray_from_worker(\&app)/g' src-tauri/src/polling.rs
+grep -n "update_tray_from" src-tauri/src/polling.rs
+```
+
+Expected: both lines now reference `update_tray_from_worker`.
 
 - [ ] **Step 6: Build the worker in `run()` and register the commands**
 
@@ -3447,8 +3809,10 @@ At the very start of the `.setup(|app| { ... })` closure, before the tray is bui
             let worker = std::sync::Arc::new(usage::worker::UsageWorker::new(roots, cache_path));
             app.manage(worker.clone());
 
-            // First pass on a background thread so the popover never blocks.
-            // Measured: a full 793 MB pass takes seconds, not minutes.
+            // First pass on a background thread so app startup is not blocked.
+            // Measured: a full 793 MB pass takes seconds. Note the worker mutex
+            // IS held for that pass, so a popover opened during it waits for
+            // the scan to finish rather than showing a partial figure.
             {
                 let handle = app.handle().clone();
                 let worker = worker.clone();
@@ -3467,7 +3831,30 @@ Replace the later `update_tray_from_stats(&handle);` call with `update_tray_from
 
 `app.path()` requires `use tauri::Manager;`, which `lib.rs` already imports.
 
-- [ ] **Step 7: Verify the Rust suite and a real build**
+- [ ] **Step 7: Persist the cache on quit**
+
+`maybe_persist()` throttles writes to at most one per 30 s during a session, so without a flush
+on exit the last few minutes of usage are lost. At the bottom of `run()`, replace:
+
+```rust
+    app.run(|_app_handle, _event| {});
+```
+
+with:
+
+```rust
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(worker) =
+                app_handle.try_state::<std::sync::Arc<usage::worker::UsageWorker>>()
+            {
+                let _ = worker.inner().persist();
+            }
+        }
+    });
+```
+
+- [ ] **Step 8: Verify the Rust suite and a real build**
 
 ```bash
 cd src-tauri && cargo test 2>&1 | tail -8
@@ -3481,10 +3868,10 @@ cd /Users/nathanaelmcmillan/Projects/claude-token-usage && npx vite build 2>&1 |
 
 Expected: frontend builds (it is unchanged, so this confirms nothing broke).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add src-tauri/src/lib.rs
+git add src-tauri/src/lib.rs src-tauri/src/polling.rs
 git commit -m "feat(usage): serve stats from the ingest worker; fix UTC month-prefix bug
 
 current_month_prefix derived the month from UTC epoch days by hand while
@@ -3549,6 +3936,16 @@ mod tests {
             PathBuf::from("/Users/me/.claude/projects/-p/1111.jsonl"),
         ];
         assert!(should_react(&paths));
+    }
+
+    #[test]
+    fn ignores_our_own_cache_file() {
+        // The cache lives outside ~/.claude, but be explicit: a watcher that
+        // reacted to its own writes would spin forever.
+        let paths = vec![PathBuf::from(
+            "/Users/me/Library/Application Support/com.claudetokenusage.dev/usage-cache.v1.json",
+        )];
+        assert!(!should_react(&paths));
     }
 
     #[test]
@@ -3660,11 +4057,16 @@ fn refresh(app: &AppHandle) {
         Some(w) => w.inner().clone(),
         None => return,
     };
-    worker.refresh_now();
-    if let Err(e) = worker.persist() {
+    let report = worker.refresh_now();
+    // maybe_persist writes only when a scan changed something and the throttle
+    // window has passed. Persisting unconditionally here would write several MB
+    // on every 60s fallback tick — gigabytes a day at idle.
+    if let Err(e) = worker.maybe_persist() {
         eprintln!("[polling] could not persist cache: {}", e);
     }
-    crate::update_tray_from_worker(app);
+    if report.files_read > 0 || report.files_retired > 0 {
+        crate::update_tray_from_worker(app);
+    }
 }
 
 ```
@@ -3681,7 +4083,7 @@ In `src-tauri/src/lib.rs`'s `setup` closure, change the watcher start to pass th
 cd src-tauri && cargo test polling:: 2>&1 | tail -15
 ```
 
-Expected: `test result: ok. 5 passed`.
+Expected: `test result: ok. 6 passed`.
 
 - [ ] **Step 5: Verify the whole suite**
 
@@ -3713,18 +4115,37 @@ git commit -m "feat(polling): recursive debounced transcript watching"
 - Consumes: Tauri commands `get_stats`, `get_diagnostics`, `refresh_usage` (Task 12); events `stats-updated`, `usage-progress` (Tasks 11-12).
 - Produces: `Diagnostics` TS interface, `getDiagnostics()`, `refreshUsage()`.
 
-**Scope note:** the dashboard's own rendering is deliberately untouched — `get_stats` still returns `StatsCache`, so `stats.ts`, `TokenSummary`, `DailyChart`, `ModelBreakdown` and `ActivityStats` all keep working. This task only adds the first-run progress indicator and surfaces the ingest diagnostics.
+**Scope note:** the dashboard's own rendering is deliberately untouched — `get_stats` still returns `StatsCache`, so `stats.ts`, `TokenSummary`, `DailyChart`, `ModelBreakdown` and `ActivityStats` all keep working. This task adds the first-run progress indicator, surfaces the ingest diagnostics, and corrects the now-false data-source label.
+
+**Deferred, deliberately:** spec 5.1 asks for a user-settable config root. `config::resolve`
+already honours `CLAUDE_CONFIG_DIR`, which covers the real relocation case for anyone launching
+from a shell; a GUI-settable override needs a persisted setting plus a command, and belongs with
+the Phase 2 settings work. This task only stops Settings from *claiming* a source it no longer
+reads.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `src/lib/__tests__/api.test.ts`:
+`src/lib/__tests__/api.test.ts` currently tests only `getCurrentMonthPrefix` and never mocks the Tauri bridge, so `vi.mocked(invoke)` would return the real function and fail with "mockResolvedValueOnce is not a function". Add the mock at the **top of the file**, after the existing imports:
 
 ```ts
+import { invoke } from "@tauri-apps/api/core";
+import { getDiagnostics, refreshUsage } from "../api";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+```
+
+Then add this as a **new `describe` block** at the end of the file:
+
+```ts
+describe("usage commands", () => {
+  afterEach(() => {
+    vi.mocked(invoke).mockReset();
+  });
+
   it("getDiagnostics invokes the get_diagnostics command", async () => {
-    const invoke = vi.mocked(await import("@tauri-apps/api/core")).invoke;
-    invoke.mockResolvedValueOnce({
+    vi.mocked(invoke).mockResolvedValueOnce({
       malformedLines: 3,
-      divergentCopies: 0,
+      revisedMessages: 13982,
       filesTracked: 1031,
       filesRetired: 12,
       lastScanMs: 4200,
@@ -3737,14 +4158,12 @@ Add to `src/lib/__tests__/api.test.ts`:
   });
 
   it("refreshUsage invokes the refresh_usage command", async () => {
-    const invoke = vi.mocked(await import("@tauri-apps/api/core")).invoke;
-    invoke.mockResolvedValueOnce(undefined);
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
     await refreshUsage();
     expect(invoke).toHaveBeenCalledWith("refresh_usage");
   });
+});
 ```
-
-and extend that file's import from `../api` to include `getDiagnostics` and `refreshUsage`.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -3763,7 +4182,8 @@ Append to `src/lib/types.ts`:
 
 export interface Diagnostics {
   malformedLines: number;
-  divergentCopies: number;
+  /** Messages a later copy revised upward. ~30% is normal, not an error. */
+  revisedMessages: number;
   filesTracked: number;
   filesRetired: number;
   lastScanMs: number;
@@ -3800,11 +4220,9 @@ Expected: all tests pass — the original 39 plus the 2 new ones.
 
 - [ ] **Step 6: Show first-run progress in the dashboard**
 
-In `src/components/Dashboard.svelte`, inside the existing `<script lang="ts">` block, add alongside the current state declarations:
+In `src/components/Dashboard.svelte`, inside the existing `<script lang="ts">` block, add alongside the current state declarations. **Do not add a `listen` import — line 3 already has one** (`import { listen, type UnlistenFn } from "@tauri-apps/api/event";`); a duplicate declaration fails the Svelte build:
 
 ```ts
-  import { listen } from "@tauri-apps/api/event";
-
   let progress = $state<{ done: number; total: number } | null>(null);
 
   $effect(() => {
@@ -3832,7 +4250,15 @@ and immediately after the component's outermost opening element in the markup, a
 
 - [ ] **Step 7: Surface diagnostics and the config root in Settings**
 
-In `src/components/Settings.svelte`, inside the existing `<script lang="ts">` block:
+First correct the label that is now false. In `src/components/Settings.svelte` line 46, the
+Data Source card still advertises the dead file; change it to:
+
+```svelte
+          <span class="text-xs font-mono text-gray-500 dark:text-gray-500">~/.claude/projects/</span>
+```
+
+Then, inside the existing `<script lang="ts">` block. The file already imports `onMount` and
+uses it for its own loading, so follow that convention rather than introducing `$effect`:
 
 ```ts
   import { getDiagnostics, refreshUsage } from "../lib/api";
@@ -3841,8 +4267,8 @@ In `src/components/Settings.svelte`, inside the existing `<script lang="ts">` bl
   let diagnostics = $state<Diagnostics | null>(null);
   let refreshing = $state(false);
 
-  $effect(() => {
-    getDiagnostics().then((d) => (diagnostics = d));
+  onMount(async () => {
+    diagnostics = await getDiagnostics();
   });
 
   async function rescan() {
@@ -3858,48 +4284,47 @@ In `src/components/Settings.svelte`, inside the existing `<script lang="ts">` bl
 
 and add this section to its markup, following the file's existing section markup style:
 
+Match the card pattern the file already uses (`bg-gray-50 dark:bg-gray-800 rounded-lg p-3`):
+
 ```svelte
-<div class="px-4 py-3 border-t border-gray-200 dark:border-gray-800">
-  <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-    Data
-  </h3>
-  {#if diagnostics}
-    <dl class="mt-2 space-y-1 text-xs text-gray-600 dark:text-gray-300">
-      <div class="flex justify-between">
-        <dt>Transcripts tracked</dt>
-        <dd>{diagnostics.filesTracked}</dd>
+    <!-- Ingest -->
+    <div>
+      <h3 class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-3">Ingest</h3>
+      <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3 space-y-2">
+        {#if diagnostics}
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-600 dark:text-gray-400">Transcripts tracked</span>
+            <span class="text-xs font-mono text-gray-500 dark:text-gray-500">{diagnostics.filesTracked}</span>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-600 dark:text-gray-400">Pruned upstream, history kept</span>
+            <span class="text-xs font-mono text-gray-500 dark:text-gray-500">{diagnostics.filesRetired}</span>
+          </div>
+          {#if diagnostics.malformedLines > 0}
+            <div class="flex justify-between items-center">
+              <span class="text-sm text-amber-600 dark:text-amber-400">Unreadable records</span>
+              <span class="text-xs font-mono text-amber-600 dark:text-amber-400">{diagnostics.malformedLines}</span>
+            </div>
+          {/if}
+          <p class="text-xs text-gray-500 dark:text-gray-500 pt-1">
+            Menu bar total sums input, output and cache tokens for this month;
+            cache reads usually dominate it.
+          </p>
+        {/if}
+        <button
+          class="text-xs text-blue-600 dark:text-blue-400 disabled:opacity-50"
+          disabled={refreshing}
+          onclick={rescan}
+        >
+          {refreshing ? "Rescanning…" : "Rescan transcripts"}
+        </button>
       </div>
-      <div class="flex justify-between">
-        <dt>Pruned upstream (history kept)</dt>
-        <dd>{diagnostics.filesRetired}</dd>
-      </div>
-      <p class="pt-1 text-gray-500 dark:text-gray-400">
-        Menu bar total sums input, output and cache tokens for the current
-        month. Cache reads usually dominate it.
-      </p>
-      {#if diagnostics.malformedLines > 0}
-        <div class="flex justify-between text-amber-600 dark:text-amber-400">
-          <dt>Unreadable records</dt>
-          <dd>{diagnostics.malformedLines}</dd>
-        </div>
-      {/if}
-      {#if diagnostics.divergentCopies > 0}
-        <div class="flex justify-between text-amber-600 dark:text-amber-400">
-          <dt>Conflicting duplicates</dt>
-          <dd>{diagnostics.divergentCopies}</dd>
-        </div>
-      {/if}
-    </dl>
-  {/if}
-  <button
-    class="mt-2 text-xs text-blue-600 dark:text-blue-400 disabled:opacity-50"
-    disabled={refreshing}
-    onclick={rescan}
-  >
-    {refreshing ? "Rescanning…" : "Rescan transcripts"}
-  </button>
-</div>
+    </div>
 ```
+
+`revisedMessages` is deliberately NOT shown: ~30% of messages get revised upward by a later
+copy, so surfacing it would read as an error rather than normal operation. It stays in
+`Diagnostics` for debugging.
 
 - [ ] **Step 8: Verify build and both suites**
 
@@ -3913,7 +4338,7 @@ Expected: 41 frontend tests pass, frontend builds, all Rust tests pass.
 
 ```bash
 git add src/lib/types.ts src/lib/api.ts src/lib/__tests__/api.test.ts src/components/Dashboard.svelte src/components/Settings.svelte
-git commit -m "feat(ui): first-run progress and ingest diagnostics"
+git commit -m "feat(ui): first-run progress, ingest diagnostics, correct source label"
 ```
 
 ---
@@ -3926,31 +4351,43 @@ Tests cannot prove we read the real Claude Code correctly. This task has no code
 
 - [ ] **Step 1: Capture ground truth independently**
 
+**This script must take the per-field MAXIMUM.** A first-wins script (`if mid in ids:
+continue`) undercounts output tokens by 45% and would cheerfully "confirm" a broken
+implementation:
+
 ```bash
-python3 - <<'PY'
-import json,glob,os,collections
-out=collections.Counter(); ids=set()
-for p in glob.glob(os.path.expanduser('~/.claude/projects/**/*.jsonl'),recursive=True):
-    for line in open(p,errors='replace'):
-        if '"type":"assistant"' not in line: continue
-        try: d=json.loads(line)
-        except: continue
-        m=d.get('message') or {}
-        u=m.get('usage'); mid=m.get('id')
-        if not u or mid in ids: continue
-        ids.add(mid)
-        if m.get('model')=='<synthetic>': continue
-        out['input']+=u.get('input_tokens',0)
-        out['output']+=u.get('output_tokens',0)
-        out['cache_read']+=u.get('cache_read_input_tokens',0)
-        out['cache_creation']+=u.get('cache_creation_input_tokens',0)
-print('distinct messages:',len(ids))
-for k,v in out.items(): print(k,v)
-print('billable total:',sum(out.values()))
-PY
+python3 - <<'EOF'
+import json, glob, os
+FIELDS = ('input_tokens', 'output_tokens',
+          'cache_read_input_tokens', 'cache_creation_input_tokens')
+best = {}   # (file, message.id) -> per-field max
+for p in glob.glob(os.path.expanduser('~/.claude/projects/**/*.jsonl'), recursive=True):
+    for line in open(p, errors='replace'):
+        if '"type":"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        m = d.get('message') or {}
+        u, mid = m.get('usage'), m.get('id')
+        if not u or not mid or m.get('model') == '<synthetic>':
+            continue
+        cur = best.setdefault((p, mid), dict.fromkeys(FIELDS, 0))
+        for f in FIELDS:              # MAX, never first, never sum
+            v = u.get(f) or 0
+            if v > cur[f]:
+                cur[f] = v
+totals = {f: sum(c[f] for c in best.values()) for f in FIELDS}
+print('distinct messages:', len(best))
+for f, v in totals.items():
+    print(f, v)
+print('billable total:', sum(totals.values()))
+EOF
 ```
 
-Record these numbers.
+Record these numbers. On this machine as of 2026-09-10 the output figure should be ~38.6M; if
+you see ~21.2M the script has reverted to first-wins.
 
 - [ ] **Step 2: Run the app and compare**
 
@@ -3960,9 +4397,14 @@ npx tauri dev
 
 Open the popover. Confirm:
 - The tray title is no longer a stale March figure.
-- The dashboard's all-time token total matches Step 1's billable total (small drift is expected only if a session wrote during the run).
-- **Critically:** the total is NOT roughly 4.7x Step 1's output figure. That multiple means dedup regressed.
-- Settings shows a plausible "Transcripts tracked" (~1030) and zero or near-zero unreadable records.
+- The dashboard's all-time token total is within ~1% of Step 1's billable total (drift is expected only if a session wrote during the run).
+- **Two failure signatures to watch for, both of which produce plausible-looking numbers:**
+  - output ~45% BELOW the script's figure -> dedup reverted to first-wins;
+  - output ~2.5x ABOVE it -> dedup is not happening at all.
+- Message counts are in the hundreds or low thousands per month, NOT ~100k. Six figures means
+  tool-result echoes are being counted as messages.
+- Settings shows a plausible "Transcripts tracked" (~1030) and zero or near-zero unreadable
+  records.
 
 - [ ] **Step 3: Verify incrementality**
 
@@ -3999,7 +4441,10 @@ cache rebuilt cleanly from a corrupted file."
 ## Definition of done
 
 - [ ] `cargo test` green, `npm test` green (41 tests), `npx vite build` succeeds.
-- [ ] Dashboard totals match an independent dedup-aware count of the transcripts.
+- [ ] Dashboard totals within ~1% of an independent **per-field-max** count of the transcripts.
+- [ ] Message counts are plausible (hundreds/thousands per month, not ~100k).
+- [ ] The cache survives a schema bump with its retired history intact.
+- [ ] An idle hour produces at most a couple of cache writes, not one per minute.
 - [ ] An unchanged refresh reads zero bytes.
 - [ ] A pruned transcript keeps its history in the cache.
 - [ ] A corrupt cache self-heals.
