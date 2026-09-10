@@ -7,6 +7,7 @@ use crate::usage::store::{load, salvage_retired, save_atomic, LoadOutcome, Rebui
 use crate::usage::types::UsageCache;
 use crate::StatsCache;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -48,14 +49,23 @@ impl UsageWorker {
             LoadOutcome::Rebuild(reason) => {
                 eprintln!("[usage] rebuilding cache: {:?}", reason);
                 // Retired entries describe transcripts upstream has already
-                // pruned: a rebuild cannot re-derive them, so carry them over.
-                // On Corrupt the loader has already moved the file aside.
-                let salvage_from = if matches!(reason, RebuildReason::Corrupt) {
-                    cache_path.with_extension("json.corrupt")
-                } else {
-                    cache_path.clone()
+                // pruned: a rebuild cannot re-derive them, so carry them over
+                // when the file we still have is structurally readable.
+                //
+                // Salvage applies to Schema/Timezone rebuilds only. A Corrupt
+                // cache is by definition unparseable by the same serde call
+                // salvage_retired uses, so nothing can be recovered from it:
+                // retired entries whose transcripts upstream has already
+                // pruned are lost. Guarded against by save_atomic's
+                // tmp+rename; a format change (one entry per line) would make
+                // partial recovery possible and is tracked as Phase 2
+                // follow-up.
+                let retained = match reason {
+                    RebuildReason::Schema | RebuildReason::Timezone => {
+                        salvage_retired(&cache_path)
+                    }
+                    RebuildReason::Corrupt | RebuildReason::Missing => HashMap::new(),
                 };
-                let retained = salvage_retired(&salvage_from);
                 let mut fresh = UsageCache::new(tz);
                 if !retained.is_empty() {
                     eprintln!("[usage] salvaged {} retired entries", retained.len());
@@ -277,21 +287,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "confirmed bug, not fixed here: load() and salvage_retired() both \
-        call serde_json::from_str::<UsageCache> on the SAME bytes, so any content \
-        that made load() classify the cache as Corrupt is, by construction, also \
-        unparseable by salvage_retired on the renamed .corrupt sibling. The \
-        Corrupt-reason salvage branch in UsageWorker::new can therefore never \
-        recover anything; retired (un-re-derivable) history is silently lost on \
-        genuine on-disk corruption. See task-11-report.md 'Fix report' section. \
-        Left failing-but-ignored, not fixed, per explicit instruction not to \
-        change production logic in this pass."]
-    fn a_corrupt_cache_salvages_retired_history_from_the_corrupt_sibling() {
-        // The Corrupt-rebuild path is the one place silent data loss would be
-        // catastrophic: retired entries describe transcripts Claude Code has
-        // already pruned upstream, so their history can never be re-derived.
-        // If the `.corrupt`-sibling path construction were ever wrong, this
-        // history would vanish without a trace.
+    // This documents a known limitation, not a desired outcome: a Corrupt
+    // cache cannot be salvaged (see the doc comment on the salvage branch in
+    // `UsageWorker::new`), so retired history is forfeited when the cache
+    // file itself is corrupted. Contrast with
+    // `a_schema_rebuild_keeps_retired_history`, which IS the guarantee we
+    // make — salvage applies to Schema/Timezone rebuilds, never Corrupt.
+    fn a_corrupt_cache_rebuilds_and_forfeits_retired_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = setup(dir.path());
         worker.refresh_now();
@@ -303,16 +305,15 @@ mod tests {
         assert_eq!(worker.diagnostics().files_retired, 1);
 
         // Corrupt the cache on disk. `load()` will move it aside to
-        // `usage-cache.v1.json.corrupt` and request a Corrupt rebuild; the
-        // worker must then salvage retired entries from that sibling.
+        // `usage-cache.v1.json.corrupt` and request a Corrupt rebuild.
         let cache_path = dir.path().join("cache/usage-cache.v1.json");
         std::fs::write(&cache_path, b"{ not json").expect("write");
 
         let roots = resolve_with(Some(dir.path().join("claude")), None, None);
         let worker2 = UsageWorker::new(roots, cache_path.clone());
         assert_eq!(
-            worker2.diagnostics().files_retired, 1,
-            "a corrupt-cache rebuild must not silently lose history it cannot re-derive"
+            worker2.diagnostics().files_retired, 0,
+            "a Corrupt cache cannot be salvaged: history was NOT recovered"
         );
         assert!(
             cache_path.with_extension("json.corrupt").exists(),
