@@ -4432,8 +4432,13 @@ print('billable total:', sum(totals.values()))
 EOF
 ```
 
-Record these numbers. On this machine as of 2026-09-10 the output figure should be ~38.6M; if
-you see ~21.2M the script has reverted to first-wins.
+Record these numbers. Measured on this machine on 2026-09-10: 46,397 distinct messages,
+output 39,028,626, cache_read 8,976,219,812, billable total 9,215,051,381. If output comes out
+near 21.4M the script has reverted to first-wins.
+
+Note the dashboard's all-time figures ALSO include the legacy seed from `stats-cache.json`
+(input 1,105,519 / output 3,366,284 / cache_read 3,797,857,831 / cache_creation 161,903,968),
+so subtract those before comparing against this script.
 
 - [ ] **Step 2: Run the app and compare**
 
@@ -4447,9 +4452,12 @@ Open the popover. Confirm:
 - **Two failure signatures to watch for, both of which produce plausible-looking numbers:**
   - output ~45% BELOW the script's figure -> dedup reverted to first-wins;
   - output ~2.5x ABOVE it -> dedup is not happening at all.
-- Message counts for days from **2026-08-13 onward** (the transcript window) are in the
-  hundreds or low thousands per month, NOT ~100k. Six figures there means tool-result echoes
-  are being counted as messages.
+- Message counts for days from **2026-08-13 onward** (the transcript window) total roughly
+  **45k**, which is the number of distinct assistant messages plus non-echo user prompts.
+  The failure signature is **~119k** — that is what counting the ~73k tool-result echoes as
+  messages produces. (An earlier draft of this criterion said "hundreds or low thousands per
+  month"; that was simply wrong, and measurement corrected it. Heavy agent use generates tens
+  of thousands of assistant messages a month.)
   **Legacy days are exempt from that check.** The imported `stats-cache.json` reports 137,401
   messages across its 36 days (~3,800/day) because the old-era counter included tool results.
   Its numbers are preserved as recorded, so all-time `total_messages` legitimately mixes two
@@ -4494,8 +4502,8 @@ cache rebuilt cleanly from a corrupted file."
 
 - [ ] `cargo test` green, `npm test` green (41 tests), `npx vite build` succeeds.
 - [ ] Dashboard totals within ~1% of an independent **per-field-max** count of the transcripts.
-- [ ] Message counts on transcript-window days (2026-08-13 on) are plausible
-      (hundreds/thousands per month, not ~100k). Legacy days exempt — see Task 15 Step 2.
+- [ ] Message counts on transcript-window days (2026-08-13 on) are ~45k, not ~119k.
+      Legacy days exempt — see Task 15 Step 2.
 - [ ] The cache survives a schema bump with its retired history intact.
 - [ ] An idle hour produces at most a couple of cache writes, not one per minute.
 - [ ] An unchanged refresh reads zero bytes.
