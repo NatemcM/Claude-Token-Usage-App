@@ -369,6 +369,48 @@ mod tests {
     }
 
     #[test]
+    fn subagent_revision_reaches_day_session_and_agent_at_the_max() {
+        // Same subagent message.id, first partial (7) then complete (156).
+        // A regression that credits the delta to the day only, or
+        // double-credits the session, would still pass every other test.
+        let mk = |out: u64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-09-10T08:32:59Z","sessionId":"parent","agentId":"a1","attributionAgent":"Explore","message":{{"id":"m1","model":"claude-sonnet-5","content":[],"usage":{{"input_tokens":1,"output_tokens":{}}}}}}}"#,
+                out
+            )
+        };
+        let text = format!("{}\n{}\n", mk(7), mk(156));
+        let mut entry = FileEntry::default();
+        ingest_text(&mut entry, &text, 0);
+
+        assert_eq!(
+            entry.days["2026-09-10"].by_model["claude-sonnet-5"].output, 156,
+            "day total must be the max, not 7 and not 163"
+        );
+        assert_eq!(
+            entry.session.by_model["claude-sonnet-5"].output, 156,
+            "session total must be the max, not 7 and not 163"
+        );
+        assert_eq!(
+            entry.agents["a1"].tokens.output, 156,
+            "agent total must be the max, not 7 and not 163"
+        );
+        assert_eq!(entry.session.message_count, 1, "one message, two lines");
+    }
+
+    #[test]
+    fn key_hash_matches_published_fnv1a_64_test_vectors() {
+        // key_hash is persisted to the cache file, so it must be a specific,
+        // stable algorithm (FNV-1a) rather than whatever DefaultHasher does
+        // this run. Swapping it for DefaultHasher would pass every other
+        // test (within-process dedup works either way) while silently
+        // breaking cache reuse across restarts.
+        assert_eq!(key_hash(""), 0xcbf29ce484222325);
+        assert_eq!(key_hash("a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(key_hash("foobar"), 0x85944171f73967e8);
+    }
+
+    #[test]
     fn malformed_lines_are_counted_and_do_not_abort_ingest() {
         let text = format!(
             "{}\n{{not json\n{}\n",
