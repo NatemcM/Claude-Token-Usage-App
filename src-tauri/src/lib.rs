@@ -246,7 +246,7 @@ pub fn run() {
             update_tray_from_worker(&handle);
 
             // Watch stats file for changes
-            polling::start(handle);
+            polling::start(handle, config::resolve(None));
 
             Ok(())
         })
