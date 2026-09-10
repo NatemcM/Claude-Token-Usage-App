@@ -4,3 +4,4 @@ pub mod dates;
 pub mod cursor;
 pub mod discovery;
 pub mod store;
+pub mod record;
