@@ -58,25 +58,62 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
         s.message_count += entry.session.message_count;
     }
 
+    // --- Fold in the one-time legacy seed (§5.4) ---
+    let mut legacy_sessions: u64 = 0;
+    let mut legacy_messages: u64 = 0;
+    let mut legacy_first_date: Option<String> = None;
+    let mut legacy_hours: HashMap<String, u64> = HashMap::new();
+    let mut legacy_day_activity: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+    let mut legacy_day_tokens: BTreeMap<String, HashMap<String, u64>> = BTreeMap::new();
+
+    if let Some(legacy) = cache.legacy.as_ref() {
+        legacy_sessions = legacy.total_sessions;
+        legacy_messages = legacy.total_messages;
+        legacy_first_date = legacy.first_session_date.clone();
+        legacy_hours = legacy.hour_counts.clone();
+        for (date, d) in &legacy.days {
+            legacy_day_activity
+                .insert(date.clone(), (d.message_count, d.session_count, d.tool_call_count));
+            legacy_day_tokens.insert(date.clone(), d.tokens_by_model.clone());
+            days.entry(date.clone()).or_default();
+        }
+        for (model, u) in &legacy.model_usage {
+            let c = model_usage.entry(model.clone()).or_default();
+            c.input += u.input_tokens;
+            c.output += u.output_tokens;
+            c.cache_read += u.cache_read_input_tokens;
+            c.cache_creation += u.cache_creation_input_tokens;
+            c.web_search += u.web_search_requests;
+        }
+    }
+
     let daily_activity: Vec<DailyActivity> = days
         .iter()
-        .map(|(date, d)| DailyActivity {
-            date: date.clone(),
-            message_count: d.message_count,
-            session_count: d.session_ids.len() as u64,
-            tool_call_count: d.tool_call_count,
+        .map(|(date, d)| {
+            let (lm, ls, lt) = legacy_day_activity.get(date).copied().unwrap_or((0, 0, 0));
+            DailyActivity {
+                date: date.clone(),
+                message_count: d.message_count + lm,
+                session_count: d.session_ids.len() as u64 + ls,
+                tool_call_count: d.tool_call_count + lt,
+            }
         })
         .collect();
 
     let daily_model_tokens: Vec<DailyModelTokens> = days
         .iter()
-        .map(|(date, d)| DailyModelTokens {
-            date: date.clone(),
-            tokens_by_model: d
+        .map(|(date, d)| {
+            let mut tokens_by_model: HashMap<String, u64> = d
                 .by_model
                 .iter()
                 .map(|(m, c)| (m.clone(), c.billable_total()))
-                .collect(),
+                .collect();
+            if let Some(legacy_tokens) = legacy_day_tokens.get(date) {
+                for (m, v) in legacy_tokens {
+                    *tokens_by_model.entry(m.clone()).or_insert(0) += v;
+                }
+            }
+            DailyModelTokens { date: date.clone(), tokens_by_model }
         })
         .collect();
 
@@ -125,6 +162,17 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
             .or_insert(0) += 1;
     }
 
+    for (hour, n) in legacy_hours {
+        *hour_counts.entry(hour).or_insert(0) += n;
+    }
+
+    let first_session_date = match (first_session_date, legacy_first_date) {
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
     let last_computed_date = days
         .keys()
         .next_back()
@@ -137,8 +185,8 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
         daily_activity,
         daily_model_tokens,
         model_usage: model_usage_out,
-        total_sessions: sessions.len() as u64,
-        total_messages: sessions.values().map(|s| s.message_count).sum(),
+        total_sessions: sessions.len() as u64 + legacy_sessions,
+        total_messages: sessions.values().map(|s| s.message_count).sum::<u64>() + legacy_messages,
         longest_session,
         first_session_date,
         hour_counts: if hour_counts.is_empty() { None } else { Some(hour_counts) },
@@ -316,5 +364,51 @@ mod tests {
         assert!(stats.daily_activity.is_empty());
         assert!(stats.longest_session.is_none());
         assert!(stats.first_session_date.is_none());
+    }
+
+    #[test]
+    fn merges_legacy_rollup_into_derived_stats() {
+        use crate::usage::legacy::{LegacyDay, LegacyRollup};
+
+        let mut cache = UsageCache::new(0);
+        cache.files.insert(
+            "/a.jsonl".into(),
+            entry_with(
+                "s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 4, 2,
+                // Real 2026-09-10 timestamps: with first_ts = 100 the live
+                // session's date would be 1970-01-01 and would wrongly win the
+                // earliest-date comparison below.
+                1789029179076, 1789029179076,
+            ),
+        );
+
+        let mut legacy = LegacyRollup::default();
+        legacy.total_sessions = 154;
+        legacy.total_messages = 900;
+        legacy.first_session_date = Some("2026-01-25".to_string());
+        legacy.hour_counts.insert("9".to_string(), 40);
+        let mut day = LegacyDay::default();
+        day.message_count = 10;
+        day.session_count = 2;
+        day.tool_call_count = 5;
+        day.tokens_by_model.insert("claude-opus-4-8".to_string(), 1000);
+        legacy.days.insert("2026-01-25".to_string(), day);
+        cache.legacy = Some(legacy);
+
+        let stats = to_stats_cache(&cache);
+
+        // Legacy day appears, and sorts before the transcript day.
+        let dates: Vec<&str> = stats.daily_activity.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(dates, vec!["2026-01-25", "2026-09-10"]);
+        let legacy_day = &stats.daily_activity[0];
+        assert_eq!(legacy_day.session_count, 2);
+        assert_eq!(legacy_day.tool_call_count, 5);
+
+        // Totals add on top of the live sessions.
+        assert_eq!(stats.total_sessions, 155, "154 legacy + 1 live");
+        assert_eq!(stats.total_messages, 904, "900 legacy + 4 live");
+        // Earliest date comes from legacy.
+        assert_eq!(stats.first_session_date.as_deref(), Some("2026-01-25"));
+        assert_eq!(stats.hour_counts.expect("hc")["9"], 40);
     }
 }
