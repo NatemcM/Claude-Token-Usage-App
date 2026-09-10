@@ -2,3 +2,4 @@ pub mod types;
 pub mod legacy;
 pub mod dates;
 pub mod cursor;
+pub mod discovery;
