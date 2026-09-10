@@ -5,7 +5,6 @@ use tauri::{
 use tauri_plugin_positioner::{Position, WindowExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 mod polling;
 mod usage;
@@ -67,19 +66,6 @@ pub struct LongestSession {
 
 // --- Helpers ---
 
-pub fn stats_cache_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".claude").join("stats-cache.json")
-}
-
-pub fn read_stats() -> Result<StatsCache, String> {
-    let path = stats_cache_path();
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Could not read stats file at {:?}: {}", path, e))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Could not parse stats file: {}", e))
-}
-
 pub fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000_000 {
         format!("{:.1}B", tokens as f64 / 1_000_000_000.0)
@@ -138,10 +124,17 @@ async fn get_diagnostics(
 async fn refresh_usage(
     worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
 ) -> Result<(), String> {
-    worker.refresh_now();
-    // Explicit user action: write immediately rather than waiting for the
-    // throttle window.
-    worker.persist()
+    let worker = worker.inner().clone();
+    // A full rescan plus a ~10 MB write would otherwise block a tokio worker
+    // thread for the duration; run it off the async runtime instead.
+    tauri::async_runtime::spawn_blocking(move || {
+        worker.refresh_now();
+        // Explicit user action: write immediately rather than waiting for the
+        // throttle window.
+        worker.persist()
+    })
+    .await
+    .map_err(|e| format!("refresh_usage task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -241,9 +234,11 @@ pub fn run() {
                 });
             }
 
-            // Set initial tray title
+            // Initial tray title is set by the spawned first-pass thread above
+            // once its scan completes (it calls update_tray_from_worker
+            // itself). A synchronous call here would block the Tauri event
+            // loop on the worker mutex until that ~800 MB first pass finishes.
             let handle = app.handle().clone();
-            update_tray_from_worker(&handle);
 
             // Watch stats file for changes
             polling::start(handle, config::resolve(None));
@@ -271,7 +266,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn make_model_usage(input: u64, output: u64, cache_read: u64, cache_create: u64) -> ModelUsage {
         ModelUsage {
@@ -425,76 +419,5 @@ mod tests {
         assert_eq!(usage.output_tokens, 2000);
         assert_eq!(usage.cache_read_input_tokens, 500);
         assert_eq!(usage.cache_creation_input_tokens, 300);
-    }
-
-    // --- JSON parsing ---
-
-    #[test]
-    fn parse_valid_stats_json() {
-        let json = r#"{
-            "version": 1,
-            "lastComputedDate": "2026-02-25",
-            "dailyActivity": [],
-            "dailyModelTokens": [],
-            "modelUsage": {
-                "claude-opus-4-6": {
-                    "inputTokens": 100,
-                    "outputTokens": 200,
-                    "cacheReadInputTokens": 50,
-                    "cacheCreationInputTokens": 25,
-                    "webSearchRequests": 0,
-                    "costUsd": 0.01
-                }
-            },
-            "totalSessions": 5,
-            "totalMessages": 42,
-            "longestSession": null,
-            "firstSessionDate": "2026-01-01",
-            "hourCounts": null
-        }"#;
-
-        let parsed: StatsCache = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.total_sessions, 5);
-        assert_eq!(parsed.total_messages, 42);
-        assert_eq!(parsed.model_usage.len(), 1);
-
-        let opus = &parsed.model_usage["claude-opus-4-6"];
-        assert_eq!(opus.input_tokens, 100);
-        assert_eq!(opus.output_tokens, 200);
-    }
-
-    #[test]
-    fn reject_invalid_json() {
-        let result: Result<StatsCache, _> = serde_json::from_str("not valid json");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_stats_from_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("stats-cache.json");
-        let mut file = std::fs::File::create(&file_path).unwrap();
-        write!(
-            file,
-            r#"{{
-                "version": 1,
-                "lastComputedDate": "2026-02-25",
-                "dailyActivity": [],
-                "dailyModelTokens": [],
-                "modelUsage": {{}},
-                "totalSessions": 3,
-                "totalMessages": 10,
-                "longestSession": null,
-                "firstSessionDate": null,
-                "hourCounts": null
-            }}"#
-        )
-        .unwrap();
-
-        let contents = std::fs::read_to_string(&file_path).unwrap();
-        let parsed: StatsCache = serde_json::from_str(&contents).unwrap();
-        assert_eq!(parsed.total_sessions, 3);
-        assert_eq!(parsed.total_messages, 10);
-        assert!(parsed.model_usage.is_empty());
     }
 }

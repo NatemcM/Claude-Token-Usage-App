@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct ConfigRoots {
+    /// Not read anywhere yet; Phase 2 (session registry) consumes it.
+    #[allow(dead_code)]
     pub claude_root: PathBuf,
     pub projects: PathBuf,
     pub sessions: PathBuf,

@@ -134,7 +134,7 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
         })
         .collect();
 
-    let longest_session = sessions
+    let live_longest_session = sessions
         .iter()
         .max_by_key(|(_, s)| s.last_ts.saturating_sub(s.first_ts))
         .filter(|(_, s)| s.last_ts > s.first_ts)
@@ -144,6 +144,24 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
             message_count: s.message_count,
             timestamp: date_key_with_offset(s.first_ts, tz),
         });
+
+    // The legacy seed's longest session was recorded by the retired
+    // stats-cache.json pipeline and would otherwise be silently discarded:
+    // whichever of live/legacy ran longer wins; if only one exists, it wins
+    // by default.
+    let legacy_longest_session = cache.legacy.as_ref().and_then(|l| l.longest_session.clone());
+    let longest_session = match (live_longest_session, legacy_longest_session) {
+        (Some(live), Some(legacy)) => {
+            if legacy.duration > live.duration {
+                Some(legacy)
+            } else {
+                Some(live)
+            }
+        }
+        (Some(live), None) => Some(live),
+        (None, Some(legacy)) => Some(legacy),
+        (None, None) => None,
+    };
 
     let first_session_date = sessions
         .values()
@@ -364,6 +382,60 @@ mod tests {
         assert!(stats.daily_activity.is_empty());
         assert!(stats.longest_session.is_none());
         assert!(stats.first_session_date.is_none());
+    }
+
+    #[test]
+    fn legacy_longest_session_wins_when_larger_than_live() {
+        use crate::usage::legacy::LegacyRollup;
+        use crate::LongestSession;
+
+        let mut cache = UsageCache::new(0);
+        // Live session spans only 1_000ms.
+        cache.files.insert(
+            "/a.jsonl".into(),
+            entry_with("s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 1, 0, 1_000, 2_000),
+        );
+
+        let mut legacy = LegacyRollup::default();
+        legacy.longest_session = Some(LongestSession {
+            session_id: "legacy-s".to_string(),
+            duration: 999_999,
+            message_count: 50,
+            timestamp: "2026-01-01".to_string(),
+        });
+        cache.legacy = Some(legacy);
+
+        let stats = to_stats_cache(&cache);
+        let longest = stats.longest_session.expect("longest");
+        assert_eq!(longest.session_id, "legacy-s");
+        assert_eq!(longest.duration, 999_999);
+    }
+
+    #[test]
+    fn live_longest_session_wins_when_larger_than_legacy() {
+        use crate::usage::legacy::LegacyRollup;
+        use crate::LongestSession;
+
+        let mut cache = UsageCache::new(0);
+        // Live session spans 500_000ms, far longer than the legacy one.
+        cache.files.insert(
+            "/a.jsonl".into(),
+            entry_with("s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 1, 0, 1_000, 501_000),
+        );
+
+        let mut legacy = LegacyRollup::default();
+        legacy.longest_session = Some(LongestSession {
+            session_id: "legacy-s".to_string(),
+            duration: 42,
+            message_count: 3,
+            timestamp: "2026-01-01".to_string(),
+        });
+        cache.legacy = Some(legacy);
+
+        let stats = to_stats_cache(&cache);
+        let longest = stats.longest_session.expect("longest");
+        assert_eq!(longest.session_id, "s1");
+        assert_eq!(longest.duration, 500_000);
     }
 
     #[test]

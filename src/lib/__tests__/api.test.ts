@@ -56,6 +56,8 @@ describe("usage commands", () => {
       filesTracked: 1031,
       filesRetired: 12,
       lastScanMs: 4200,
+      legacyThrough: "2026-03-10",
+      projectsRoot: "/home/me/.claude/projects",
     });
 
     const d = await getDiagnostics();

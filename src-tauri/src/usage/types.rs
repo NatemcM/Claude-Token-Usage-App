@@ -5,19 +5,36 @@ use std::path::PathBuf;
 /// Bump to force a full rebuild of the cache on next load.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Used to omit zero-valued count fields from serialized `TokenCounts`: five
+/// of nine fields are usually zero, so this roughly halves the cache file.
+/// `default` on the field is required so an omitted field still deserializes
+/// as 0 rather than failing.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCounts {
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub input: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub output: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_creation: u64,
     /// Detail slice of cache_creation, not additive with it.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_1h: u64,
     /// Detail slice of cache_creation, not additive with it.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_5m: u64,
     /// Detail slice of output, not additive with it.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub thinking: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub web_search: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub web_fetch: u64,
 }
 
@@ -244,7 +261,14 @@ mod tests {
         assert_eq!(back.tz_offset_minutes, 420);
         let e = back.files.get(std::path::Path::new("/tmp/a.jsonl")).expect("entry");
         assert_eq!(e.session.session_id, "s1");
-        assert_eq!(e.seen.get(&7).expect("credited").output, 99);
+        let credited = e.seen.get(&7).expect("credited");
+        assert_eq!(credited.output, 99);
+        // The other eight fields are 0 and therefore omitted from the JSON
+        // (skip_serializing_if = "is_zero"); `default` on each field must
+        // still bring them back as 0, not fail deserialization.
+        assert_eq!(credited.input, 0);
+        assert_eq!(credited.cache_read, 0);
+        assert_eq!(credited.cache_creation, 0);
         assert!(e.seen_tools.contains(&11));
         assert!(e.seen_users.contains(&13));
         assert!(e.days.contains_key("2026-09-10"));

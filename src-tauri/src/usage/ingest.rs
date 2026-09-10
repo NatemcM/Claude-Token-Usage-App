@@ -42,7 +42,8 @@ pub fn ingest_line(
     apply_record(entry, &rec, tz_offset_minutes, stats);
 }
 
-/// Convenience loop over `ingest_line`, used by tests.
+/// Convenience loop over `ingest_line`, used by tests. No production caller.
+#[cfg(test)]
 pub fn ingest_text(entry: &mut FileEntry, text: &str, tz_offset_minutes: i32) -> IngestStats {
     let mut stats = IngestStats::default();
     for line in text.lines() {

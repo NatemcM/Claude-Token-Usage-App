@@ -22,12 +22,27 @@ pub struct Diagnostics {
     pub files_tracked: usize,
     pub files_retired: usize,
     pub last_scan_ms: u64,
+    /// The last date key present in the one-time legacy seed's days, i.e. the
+    /// last day the retired stats-cache.json pipeline covers. None when no
+    /// legacy seed exists. Lets the UI mark that earliest range as imported
+    /// history rather than presenting it as live transcript data (spec §5.4).
+    pub legacy_through: Option<String>,
+    /// Display form of the projects root actually in use, so the UI never has
+    /// to hardcode `~/.claude/projects/` (which is wrong whenever
+    /// CLAUDE_CONFIG_DIR is set).
+    pub projects_root: String,
 }
 
-/// Minimum gap between cache writes. The cache is several MB and transcripts
-/// change many times per second, so an ungated persist would write gigabytes
-/// a day.
-const MIN_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
+/// Minimum gap between cache writes. The cache is ~9.6 MB and transcripts can
+/// change many times a minute, so an ungated persist would write tens of GB a
+/// day under steady activity. Losing a queued write here is cheap: `days` and
+/// the file cursors always roll back together (the cursor only advances after
+/// its bytes are folded into `days`), so on the next scan those bytes are
+/// simply re-read and the same totals re-derived — it is re-work, not data
+/// loss. `persist()` still runs unconditionally on quit and on an explicit
+/// user rescan, so a crash between throttled writes loses at most this
+/// window's worth of ingest work, never a whole session's history.
+const MIN_PERSIST_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Owns the cache. Every mutation goes through one mutex, so the watcher, the
 /// fallback poll, manual refresh and `get_stats` cannot race or double-count.
@@ -120,12 +135,18 @@ impl UsageWorker {
 
     pub fn diagnostics(&self) -> Diagnostics {
         let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let legacy_through = guard
+            .legacy
+            .as_ref()
+            .and_then(|l| l.days.keys().next_back().cloned());
         Diagnostics {
             malformed_lines: guard.files.values().map(|e| e.malformed_lines).sum(),
             revised_messages: guard.files.values().map(|e| e.revised_messages).sum(),
             files_tracked: guard.files.len(),
             files_retired: guard.files.values().filter(|e| e.retired).count(),
             last_scan_ms: self.last_scan_ms.load(Ordering::Relaxed),
+            legacy_through,
+            projects_root: self.roots.projects.display().to_string(),
         }
     }
 
@@ -181,6 +202,23 @@ mod tests {
         UsageWorker::new(roots, dir.join("cache/usage-cache.v1.json"))
     }
 
+    /// A second, untouched transcript on a different day than `setup`'s, so
+    /// tests that delete `setup`'s file don't leave the projects root
+    /// entirely empty of jsonl files. Fix 1(b) deliberately treats a fully
+    /// empty discovery result as an implausible transient failure rather
+    /// than "everything vanished", so without this companion file the
+    /// deletion in those tests would never actually retire anything.
+    fn write_stable_companion(dir: &std::path::Path) {
+        let path = dir.join("claude/projects/-p/companion.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"s-companion","message":{{"id":"c1","model":"claude-opus-5","content":[],"usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+        )
+        .expect("write");
+        f.flush().expect("flush");
+    }
+
     #[test]
     fn refresh_then_snapshot_exposes_stats() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -230,9 +268,10 @@ mod tests {
     fn a_schema_rebuild_keeps_retired_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = setup(dir.path());
+        write_stable_companion(dir.path());
         worker.refresh_now();
 
-        // Retire the only transcript, then persist that state.
+        // Retire the transcript from `setup`, then persist that state.
         std::fs::remove_file(dir.path().join("claude/projects/-p/s.jsonl")).expect("rm");
         worker.refresh_now();
         worker.persist().expect("persist");
@@ -248,6 +287,11 @@ mod tests {
 
         let roots = resolve_with(Some(dir.path().join("claude")), None, None);
         let worker2 = UsageWorker::new(roots, cache_path);
+        // Salvage only carries over RETIRED entries, so the still-present
+        // companion file isn't in worker2's cache yet. A real startup always
+        // scans immediately after constructing the worker (see setup() in
+        // lib.rs), which is what repopulates it; do the same here.
+        worker2.refresh_now();
         assert_eq!(
             worker2.diagnostics().files_retired, 1,
             "a rebuild must not discard history it cannot re-derive"
@@ -296,9 +340,10 @@ mod tests {
     fn a_corrupt_cache_rebuilds_and_forfeits_retired_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = setup(dir.path());
+        write_stable_companion(dir.path());
         worker.refresh_now();
 
-        // Retire the only transcript, then persist that state.
+        // Retire the transcript from `setup`, then persist that state.
         std::fs::remove_file(dir.path().join("claude/projects/-p/s.jsonl")).expect("rm");
         worker.refresh_now();
         worker.persist().expect("persist");
@@ -325,6 +370,7 @@ mod tests {
     fn a_retired_file_that_reappears_with_more_content_is_unretired() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = setup(dir.path());
+        write_stable_companion(dir.path());
         worker.refresh_now();
 
         let path = dir.path().join("claude/projects/-p/s.jsonl");

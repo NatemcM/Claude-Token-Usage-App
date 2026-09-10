@@ -45,18 +45,9 @@ pub fn hour_with_offset(ts_ms: i64, offset_minutes: i32) -> u32 {
     shifted(ts_ms, offset_minutes).hour()
 }
 
-/// Day key in the machine's current local timezone.
-pub fn local_date_key(ts_ms: i64) -> String {
-    date_key_with_offset(ts_ms, current_tz_offset_minutes())
-}
-
 /// Month prefix in the machine's current local timezone.
 pub fn local_month_prefix(ts_ms: i64) -> String {
     month_prefix_with_offset(ts_ms, current_tz_offset_minutes())
-}
-
-pub fn local_hour(ts_ms: i64) -> u32 {
-    hour_with_offset(ts_ms, current_tz_offset_minutes())
 }
 
 #[cfg(test)]

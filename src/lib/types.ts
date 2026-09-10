@@ -72,4 +72,8 @@ export interface Diagnostics {
   filesTracked: number;
   filesRetired: number;
   lastScanMs: number;
+  /** Last date key covered by the one-time legacy seed, or null if none exists. */
+  legacyThrough: string | null;
+  /** Display form of the projects root actually in use. */
+  projectsRoot: string;
 }

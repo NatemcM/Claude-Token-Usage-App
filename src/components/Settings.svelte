@@ -22,7 +22,11 @@
   });
 
   onMount(async () => {
-    diagnostics = await getDiagnostics();
+    try {
+      diagnostics = await getDiagnostics();
+    } catch {
+      // Ignore: leave the Ingest panel empty rather than an unhandled rejection.
+    }
   });
 
   async function rescan() {
@@ -59,7 +63,7 @@
       <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3 space-y-2">
         <div class="flex justify-between items-center">
           <span class="text-sm text-gray-600 dark:text-gray-400">Source</span>
-          <span class="text-xs font-mono text-gray-500 dark:text-gray-500">~/.claude/projects/</span>
+          <span class="text-xs font-mono text-gray-500 dark:text-gray-500">{diagnostics?.projectsRoot ?? "~/.claude/projects/"}</span>
         </div>
         <div class="flex justify-between items-center">
           <span class="text-sm text-gray-600 dark:text-gray-400">Status</span>
@@ -111,6 +115,11 @@
             Menu bar total sums input, output and cache tokens for this month;
             cache reads usually dominate it.
           </p>
+          {#if diagnostics.legacyThrough}
+            <p class="text-xs text-gray-500 dark:text-gray-500 pt-1">
+              Days up to {diagnostics.legacyThrough} are imported history from a retired Claude Code cache.
+            </p>
+          {/if}
         {/if}
         <button
           class="text-xs text-blue-600 dark:text-blue-400 disabled:opacity-50"
