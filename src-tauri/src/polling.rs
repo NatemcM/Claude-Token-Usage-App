@@ -30,7 +30,7 @@ pub fn start(app: AppHandle) {
 
                     if is_stats_file {
                         if let EventKind::Modify(_) | EventKind::Create(_) = event.kind {
-                            crate::update_tray_from_stats(&app);
+                            crate::update_tray_from_worker(&app);
                         }
                     }
                 }
@@ -39,7 +39,7 @@ pub fn start(app: AppHandle) {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Periodic refresh even without file changes
-                    crate::update_tray_from_stats(&app);
+                    crate::update_tray_from_worker(&app);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break;

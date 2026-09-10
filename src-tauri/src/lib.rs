@@ -93,37 +93,7 @@ pub fn format_tokens(tokens: u64) -> String {
 }
 
 pub fn current_month_prefix() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = now / 86400;
-    let mut y = 1970i32;
-    let mut remaining = days as i32;
-    loop {
-        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-        let days_in_year = if leap { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ];
-    let mut m = 1usize;
-    for &md in &month_days {
-        if remaining < md {
-            break;
-        }
-        remaining -= md;
-        m += 1;
-    }
-    format!("{:04}-{:02}", y, m)
+    usage::dates::local_month_prefix(usage::dates::now_ms())
 }
 
 pub fn current_month_tokens(stats: &StatsCache) -> u64 {
@@ -136,23 +106,42 @@ pub fn current_month_tokens(stats: &StatsCache) -> u64 {
         .sum()
 }
 
-pub fn update_tray_from_stats(app: &AppHandle) {
-    if let Ok(stats) = read_stats() {
-        let month_tokens = current_month_tokens(&stats);
-        let title = format_tokens(month_tokens);
-        if let Some(tray) = app.tray_by_id("main-tray") {
-            let _ = tray.set_title(Some(&title));
-        }
-        // Notify frontend
-        let _ = app.emit("stats-updated", ());
+pub fn update_tray_from_worker(app: &AppHandle) {
+    let worker = match app.try_state::<std::sync::Arc<usage::worker::UsageWorker>>() {
+        Some(w) => w.inner().clone(),
+        None => return,
+    };
+    let stats = worker.snapshot();
+    let month_tokens = current_month_tokens(&stats);
+    let title = format_tokens(month_tokens);
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_title(Some(&title));
     }
+    let _ = app.emit("stats-updated", ());
 }
 
 // --- Tauri Commands ---
 
 #[tauri::command]
-async fn get_stats() -> Result<StatsCache, String> {
-    read_stats()
+async fn get_stats(worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>) -> Result<StatsCache, String> {
+    Ok(worker.snapshot())
+}
+
+#[tauri::command]
+async fn get_diagnostics(
+    worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
+) -> Result<usage::worker::Diagnostics, String> {
+    Ok(worker.diagnostics())
+}
+
+#[tauri::command]
+async fn refresh_usage(
+    worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
+) -> Result<(), String> {
+    worker.refresh_now();
+    // Explicit user action: write immediately rather than waiting for the
+    // throttle window.
+    worker.persist()
 }
 
 #[tauri::command]
@@ -187,9 +176,37 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .invoke_handler(tauri::generate_handler![
             get_stats,
+            get_diagnostics,
+            refresh_usage,
             update_tray_title,
         ])
         .setup(|app| {
+            let roots = config::resolve(None);
+            let cache_path = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app data dir: {}", e))?
+                .join("usage-cache.v1.json");
+            let worker = std::sync::Arc::new(usage::worker::UsageWorker::new(roots, cache_path));
+            app.manage(worker.clone());
+
+            // First pass on a background thread so app startup is not blocked.
+            // Measured: a full 793 MB pass takes seconds. Note the worker mutex
+            // IS held for that pass, so a popover opened during it waits for
+            // the scan to finish rather than showing a partial figure.
+            {
+                let handle = app.handle().clone();
+                let worker = worker.clone();
+                std::thread::spawn(move || {
+                    let mut cb = |done: usize, total: usize| {
+                        let _ = handle.emit("usage-progress", (done, total));
+                    };
+                    worker.refresh_with_progress(Some(&mut cb));
+                    let _ = worker.persist();
+                    update_tray_from_worker(&handle);
+                });
+            }
+
             // Create tray icon from dedicated template image
             let tray_icon = tauri::image::Image::from_bytes(
                 include_bytes!("../icons/tray-icon.png"),
@@ -226,7 +243,7 @@ pub fn run() {
 
             // Set initial tray title
             let handle = app.handle().clone();
-            update_tray_from_stats(&handle);
+            update_tray_from_worker(&handle);
 
             // Watch stats file for changes
             polling::start(handle);
@@ -240,7 +257,15 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-    app.run(|_app_handle, _event| {});
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(worker) =
+                app_handle.try_state::<std::sync::Arc<usage::worker::UsageWorker>>()
+            {
+                let _ = worker.inner().persist();
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -311,6 +336,27 @@ mod tests {
     }
 
     // --- current_month_prefix ---
+
+    #[test]
+    fn current_month_prefix_matches_local_time_not_utc() {
+        // The hand-rolled UTC epoch-day math disagreed with the frontend's
+        // local-time month for the first hours of each month east of UTC.
+        let expected = crate::usage::dates::local_month_prefix(
+            crate::usage::dates::now_ms(),
+        );
+        assert_eq!(current_month_prefix(), expected);
+    }
+
+    #[test]
+    fn current_month_prefix_is_well_formed() {
+        let p = current_month_prefix();
+        assert_eq!(p.len(), 7, "expected YYYY-MM, got {}", p);
+        assert_eq!(&p[4..5], "-");
+        let year: i32 = p[0..4].parse().expect("year");
+        let month: u32 = p[5..7].parse().expect("month");
+        assert!(year >= 2026, "year was {}", year);
+        assert!((1..=12).contains(&month), "month was {}", month);
+    }
 
     #[test]
     fn current_month_prefix_format() {
