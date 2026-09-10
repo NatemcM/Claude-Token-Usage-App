@@ -62,3 +62,14 @@ export interface DailyMessages {
   messages: number;
   toolCalls: number;
 }
+
+// --- Ingest diagnostics (from the Rust usage worker) ---
+
+export interface Diagnostics {
+  malformedLines: number;
+  /** Messages a later copy revised upward. ~30% is normal, not an error. */
+  revisedMessages: number;
+  filesTracked: number;
+  filesRetired: number;
+  lastScanMs: number;
+}

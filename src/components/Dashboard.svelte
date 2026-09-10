@@ -29,6 +29,17 @@
   let loading = $state(true);
   let error = $state("");
   let lastRefresh = $state<Date | null>(null);
+  let progress = $state<{ done: number; total: number } | null>(null);
+
+  $effect(() => {
+    const unlisten = listen<[number, number]>("usage-progress", (e) => {
+      const [done, total] = e.payload;
+      progress = done >= total ? null : { done, total };
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  });
 
   // Derived from stats
   let monthPrefix = $state(getCurrentMonthPrefix());
@@ -88,6 +99,13 @@
 </script>
 
 <div class="flex flex-col h-full">
+  {#if progress}
+    <div
+      class="px-4 py-2 text-xs text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-800"
+    >
+      Reading transcripts… {progress.done} / {progress.total}
+    </div>
+  {/if}
   <!-- Header -->
   <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
     <div>

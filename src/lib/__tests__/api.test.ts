@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { getCurrentMonthPrefix } from "../api";
+import { invoke } from "@tauri-apps/api/core";
+import { getDiagnostics, refreshUsage } from "../api";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 describe("getCurrentMonthPrefix", () => {
   afterEach(() => {
@@ -37,5 +41,32 @@ describe("getCurrentMonthPrefix", () => {
     vi.setSystemTime(new Date("2027-01-01"));
     expect(getCurrentMonthPrefix()).toBe("2027-01");
     vi.useRealTimers();
+  });
+});
+
+describe("usage commands", () => {
+  afterEach(() => {
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("getDiagnostics invokes the get_diagnostics command", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      malformedLines: 3,
+      revisedMessages: 13982,
+      filesTracked: 1031,
+      filesRetired: 12,
+      lastScanMs: 4200,
+    });
+
+    const d = await getDiagnostics();
+    expect(invoke).toHaveBeenCalledWith("get_diagnostics");
+    expect(d.filesTracked).toBe(1031);
+    expect(d.malformedLines).toBe(3);
+  });
+
+  it("refreshUsage invokes the refresh_usage command", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
+    await refreshUsage();
+    expect(invoke).toHaveBeenCalledWith("refresh_usage");
   });
 });

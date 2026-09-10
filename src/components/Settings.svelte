@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getStats } from "../lib/api";
-  import type { StatsCache } from "../lib/types";
+  import { getStats, getDiagnostics, refreshUsage } from "../lib/api";
+  import type { StatsCache, Diagnostics } from "../lib/types";
 
   interface Props {
     onBack: () => void;
@@ -10,6 +10,8 @@
   let { onBack }: Props = $props();
 
   let stats = $state<StatsCache | null>(null);
+  let diagnostics = $state<Diagnostics | null>(null);
+  let refreshing = $state(false);
 
   onMount(async () => {
     try {
@@ -18,6 +20,20 @@
       // Ignore
     }
   });
+
+  onMount(async () => {
+    diagnostics = await getDiagnostics();
+  });
+
+  async function rescan() {
+    refreshing = true;
+    try {
+      await refreshUsage();
+      diagnostics = await getDiagnostics();
+    } finally {
+      refreshing = false;
+    }
+  }
 </script>
 
 <div class="flex flex-col h-full">
@@ -43,7 +59,7 @@
       <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3 space-y-2">
         <div class="flex justify-between items-center">
           <span class="text-sm text-gray-600 dark:text-gray-400">Source</span>
-          <span class="text-xs font-mono text-gray-500 dark:text-gray-500">~/.claude/stats-cache.json</span>
+          <span class="text-xs font-mono text-gray-500 dark:text-gray-500">~/.claude/projects/</span>
         </div>
         <div class="flex justify-between items-center">
           <span class="text-sm text-gray-600 dark:text-gray-400">Status</span>
@@ -69,6 +85,40 @@
             </span>
           </div>
         {/if}
+      </div>
+    </div>
+
+    <!-- Ingest -->
+    <div>
+      <h3 class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-3">Ingest</h3>
+      <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3 space-y-2">
+        {#if diagnostics}
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-600 dark:text-gray-400">Transcripts tracked</span>
+            <span class="text-xs font-mono text-gray-500 dark:text-gray-500">{diagnostics.filesTracked}</span>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-600 dark:text-gray-400">Pruned upstream, history kept</span>
+            <span class="text-xs font-mono text-gray-500 dark:text-gray-500">{diagnostics.filesRetired}</span>
+          </div>
+          {#if diagnostics.malformedLines > 0}
+            <div class="flex justify-between items-center">
+              <span class="text-sm text-amber-600 dark:text-amber-400">Unreadable records</span>
+              <span class="text-xs font-mono text-amber-600 dark:text-amber-400">{diagnostics.malformedLines}</span>
+            </div>
+          {/if}
+          <p class="text-xs text-gray-500 dark:text-gray-500 pt-1">
+            Menu bar total sums input, output and cache tokens for this month;
+            cache reads usually dominate it.
+          </p>
+        {/if}
+        <button
+          class="text-xs text-blue-600 dark:text-blue-400 disabled:opacity-50"
+          disabled={refreshing}
+          onclick={rescan}
+        >
+          {refreshing ? "Rescanning…" : "Rescan transcripts"}
+        </button>
       </div>
     </div>
 
