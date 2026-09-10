@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod polling;
 mod usage;
+mod config;
 
 // --- Stats Cache Types (matches ~/.claude/stats-cache.json) ---
 
