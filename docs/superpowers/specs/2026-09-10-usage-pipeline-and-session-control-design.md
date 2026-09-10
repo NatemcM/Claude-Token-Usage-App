@@ -440,3 +440,14 @@ real data; Phase 4 may never be written.
   token dashboard.
 - **`sysinfo` on a future sandboxed/notarized build** may lose visibility of other processes.
   Recorded as the hard constraint in §3.
+- **A corrupt cache forfeits retired history.** Discovered during implementation: `load`
+  returns `Corrupt` exactly when `serde_json::from_str::<UsageCache>` fails, and any salvage
+  pass over the same bytes uses the same call — so nothing can be recovered from a corrupt
+  cache. Retired entries (whose source transcripts upstream has already pruned) are therefore
+  unrecoverable in that case. Mitigated by `save_atomic`'s tmp+rename, which makes a torn
+  write near-impossible, so the realistic causes are disk error or tampering. The behaviour is
+  pinned by a test named for the limitation rather than left implicit.
+  **Phase 2 follow-up:** storing the cache as one JSON object per line would make partial
+  recovery possible (unparseable lines skipped, the rest salvaged) and would also make appends
+  cheaper. Salvage on the Schema and Timezone rebuilds — the deliberate, routine triggers —
+  works today and is tested.
