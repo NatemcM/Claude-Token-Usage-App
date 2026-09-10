@@ -7,3 +7,5 @@ pub mod store;
 pub mod record;
 pub mod ingest;
 pub mod adapter;
+pub mod scanner;
+pub mod worker;
