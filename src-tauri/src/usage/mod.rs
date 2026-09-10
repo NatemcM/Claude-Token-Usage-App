@@ -6,3 +6,4 @@ pub mod discovery;
 pub mod store;
 pub mod record;
 pub mod ingest;
+pub mod adapter;
