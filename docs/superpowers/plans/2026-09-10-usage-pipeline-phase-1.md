@@ -3439,6 +3439,38 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_rebuild_keeps_retired_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = setup(dir.path());
+        worker.refresh_now();
+
+        // Retire the only transcript, then persist that state.
+        std::fs::remove_file(dir.path().join("claude/projects/-p/s.jsonl")).expect("rm");
+        worker.refresh_now();
+        worker.persist().expect("persist");
+        assert_eq!(worker.diagnostics().files_retired, 1);
+        let tokens_before = worker.snapshot();
+
+        // Force a schema rebuild by bumping the stored schema on disk.
+        let cache_path = dir.path().join("cache/usage-cache.v1.json");
+        let raw = std::fs::read_to_string(&cache_path).expect("read");
+        let mut v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        v["schema"] = serde_json::json!(9999);
+        std::fs::write(&cache_path, v.to_string()).expect("write");
+
+        let roots = resolve_with(Some(dir.path().join("claude")), None, None);
+        let worker2 = UsageWorker::new(roots, cache_path);
+        assert_eq!(
+            worker2.diagnostics().files_retired, 1,
+            "a rebuild must not discard history it cannot re-derive"
+        );
+        assert_eq!(
+            worker2.snapshot().daily_model_tokens.len(),
+            tokens_before.daily_model_tokens.len()
+        );
+    }
+
+    #[test]
     fn maybe_persist_writes_once_then_throttles() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = setup(dir.path());
@@ -3512,7 +3544,7 @@ use crate::usage::adapter::to_stats_cache;
 use crate::usage::dates::current_tz_offset_minutes;
 use crate::usage::legacy::seed_from_stats_cache;
 use crate::usage::scanner::{scan_once, ScanReport};
-use crate::usage::store::{load, save_atomic, LoadOutcome};
+use crate::usage::store::{load, salvage_retired, save_atomic, LoadOutcome, RebuildReason};
 use crate::usage::types::UsageCache;
 use crate::StatsCache;
 use serde::Serialize;
@@ -3556,7 +3588,21 @@ impl UsageWorker {
             LoadOutcome::Loaded(c) => c,
             LoadOutcome::Rebuild(reason) => {
                 eprintln!("[usage] rebuilding cache: {:?}", reason);
-                UsageCache::new(tz)
+                // Retired entries describe transcripts upstream has already
+                // pruned: a rebuild cannot re-derive them, so carry them over.
+                // On Corrupt the loader has already moved the file aside.
+                let salvage_from = if matches!(reason, RebuildReason::Corrupt) {
+                    cache_path.with_extension("json.corrupt")
+                } else {
+                    cache_path.clone()
+                };
+                let retained = salvage_retired(&salvage_from);
+                let mut fresh = UsageCache::new(tz);
+                if !retained.is_empty() {
+                    eprintln!("[usage] salvaged {} retired entries", retained.len());
+                    fresh.files = retained;
+                }
+                fresh
             }
         };
         // One-time seed of the retired stats-cache.json history.
@@ -3648,7 +3694,7 @@ Add `pub mod worker;` to `src-tauri/src/usage/mod.rs`.
 cd src-tauri && cargo test usage::worker 2>&1 | tail -15
 ```
 
-Expected: `test result: ok. 6 passed`.
+Expected: `test result: ok. 7 passed`.
 
 - [ ] **Step 9: Commit**
 
