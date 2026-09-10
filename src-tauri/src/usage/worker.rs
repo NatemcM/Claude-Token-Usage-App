@@ -277,6 +277,95 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "confirmed bug, not fixed here: load() and salvage_retired() both \
+        call serde_json::from_str::<UsageCache> on the SAME bytes, so any content \
+        that made load() classify the cache as Corrupt is, by construction, also \
+        unparseable by salvage_retired on the renamed .corrupt sibling. The \
+        Corrupt-reason salvage branch in UsageWorker::new can therefore never \
+        recover anything; retired (un-re-derivable) history is silently lost on \
+        genuine on-disk corruption. See task-11-report.md 'Fix report' section. \
+        Left failing-but-ignored, not fixed, per explicit instruction not to \
+        change production logic in this pass."]
+    fn a_corrupt_cache_salvages_retired_history_from_the_corrupt_sibling() {
+        // The Corrupt-rebuild path is the one place silent data loss would be
+        // catastrophic: retired entries describe transcripts Claude Code has
+        // already pruned upstream, so their history can never be re-derived.
+        // If the `.corrupt`-sibling path construction were ever wrong, this
+        // history would vanish without a trace.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = setup(dir.path());
+        worker.refresh_now();
+
+        // Retire the only transcript, then persist that state.
+        std::fs::remove_file(dir.path().join("claude/projects/-p/s.jsonl")).expect("rm");
+        worker.refresh_now();
+        worker.persist().expect("persist");
+        assert_eq!(worker.diagnostics().files_retired, 1);
+
+        // Corrupt the cache on disk. `load()` will move it aside to
+        // `usage-cache.v1.json.corrupt` and request a Corrupt rebuild; the
+        // worker must then salvage retired entries from that sibling.
+        let cache_path = dir.path().join("cache/usage-cache.v1.json");
+        std::fs::write(&cache_path, b"{ not json").expect("write");
+
+        let roots = resolve_with(Some(dir.path().join("claude")), None, None);
+        let worker2 = UsageWorker::new(roots, cache_path.clone());
+        assert_eq!(
+            worker2.diagnostics().files_retired, 1,
+            "a corrupt-cache rebuild must not silently lose history it cannot re-derive"
+        );
+        assert!(
+            cache_path.with_extension("json.corrupt").exists(),
+            "the corrupt cache must be moved aside, not deleted"
+        );
+    }
+
+    #[test]
+    fn a_retired_file_that_reappears_with_more_content_is_unretired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = setup(dir.path());
+        worker.refresh_now();
+
+        let path = dir.path().join("claude/projects/-p/s.jsonl");
+        std::fs::remove_file(&path).expect("rm");
+        worker.refresh_now();
+        assert_eq!(worker.diagnostics().files_retired, 1);
+
+        // Recreate at the same path with strictly more content than before.
+        // mtime must differ for the scan to notice.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f = std::fs::File::create(&path).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-09-10T08:32:59Z","sessionId":"s-1","message":{{"id":"m1","model":"claude-opus-5","content":[],"usage":{{"input_tokens":1,"output_tokens":9,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+        )
+        .expect("write");
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-09-10T08:33:00Z","sessionId":"s-1","message":{{"id":"m2","model":"claude-opus-5","content":[],"usage":{{"input_tokens":1,"output_tokens":19,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+        )
+        .expect("write");
+        f.flush().expect("flush");
+
+        worker.refresh_now();
+        assert_eq!(
+            worker.diagnostics().files_retired, 0,
+            "a reappeared file must have its retired flag cleared"
+        );
+
+        let stats = worker.snapshot();
+        let day = stats
+            .daily_model_tokens
+            .iter()
+            .find(|d| d.date == "2026-09-10")
+            .expect("day");
+        assert_eq!(
+            day.tokens_by_model["claude-opus-5"], 30,
+            "tokens must reflect the reappeared file's content (10 + 20)"
+        );
+    }
+
+    #[test]
     fn concurrent_refreshes_do_not_double_count() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = std::sync::Arc::new(setup(dir.path()));
