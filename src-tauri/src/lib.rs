@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod polling;
+mod usage;
 
 // --- Stats Cache Types (matches ~/.claude/stats-cache.json) ---
 
