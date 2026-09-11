@@ -3034,11 +3034,23 @@ action; the tray count fell when a session exited; toggle persisted."
 ## Definition of done
 
 - [ ] `cargo test` green, `npm test` green (51 tests), `npx vite build` succeeds.
-- [ ] `cargo clippy --all-targets` introduces no new warnings. Record the count
-      before starting and after finishing; they must match. (Phase 1 left a
-      non-zero baseline, so "zero warnings" is not the bar — "no NEW warnings"
-      is. `FakeProbe` is `#[cfg(test)]` and the unread `kind` /
-      `start_time_secs` fields were dropped precisely to hold this line.)
+- [ ] `cargo clippy --all-targets` introduces no new warnings **measured at the
+      END of the branch, not per task.** Mid-branch this is expected to rise and
+      fall: each task lands code before its caller exists, so `probe`,
+      `SessionFile`, `read_registry` and friends each spend a task or two flagged
+      "never used" until a later task consumes them. Judging per-task would flag
+      correct work.
+      Count with `cargo clippy --all-targets 2>&1 | grep -c "^warning: "` minus
+      the per-target "generated N warnings" summary lines, or just compare the
+      warning TEXTS. **Measured baseline on main: 7 real warnings** — useless
+      `format!`, `or_insert_with`, too many arguments (8/7), collapsible `if`,
+      manual `RangeInclusive::contains`, large enum variant, and one `field 0 is
+      never read`. The branch must end at those same 7.
+      `FakeProbe` is `#[cfg(test)]` and the unread `kind` / `start_time_secs`
+      fields were dropped precisely to hold this line. Note `RawSession` carries
+      a justified `#[allow(dead_code)]`: rustc's dead-code lint flags EVERY field
+      of a struct that only `Deserialize` constructs, even fields the code plainly
+      reads — verified by removing the attribute and observing all nine flagged.
 - [ ] The Sessions tab lists exactly the live sessions the registry and process table agree on.
 - [ ] A session with no transcript renders "no activity yet" rather than an error or a bogus age.
 - [ ] Idle age reflects non-usage activity (a long Bash call does not read as idle).
