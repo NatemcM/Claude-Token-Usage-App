@@ -117,7 +117,9 @@
           </p>
           {#if diagnostics.legacyThrough}
             <p class="text-xs text-gray-500 dark:text-gray-500 pt-1">
-              Days up to {diagnostics.legacyThrough} are imported history from a retired Claude Code cache.
+              Days up to {diagnostics.legacyThrough} are imported history from a retired Claude Code
+              cache. Its message counts are excluded, because that era counted tool results as
+              messages.
             </p>
           {/if}
         {/if}

@@ -267,9 +267,17 @@ leaves `content` lazy.
 
 ### 5.4 Legacy seed
 
-`stats-cache.json` covers 2026-01-25 -> 2026-03-10 (36 days, 154 sessions) with **no overlap**
-with transcripts. Import it once into a `legacy` retired rollup so that history is preserved
-rather than silently dropped. Mark it plainly as legacy in the UI's earliest range.
+`stats-cache.json` covers 2026-01-25 -> 2026-03-10 (36 days, 154 sessions, 3.96B billable
+tokens) with **no overlap** with transcripts. Import it once into a `legacy` retired rollup so
+that history is preserved rather than silently dropped. Mark it plainly as legacy in the UI's
+earliest range.
+
+**Message counts are the one exception: they are excluded, not imported.** The retired cache
+counted tool results as messages (137,401 across 36 days, ~3,800/day) while this pipeline
+excludes tool-result echoes (~1,620/day). Summing them would report an all-time figure mixing
+two incompatible definitions, dominated by the legacy era. Tokens, sessions, tool calls and the
+36 days of chart history ARE comparable across the eras and are imported. The Settings note
+states the exclusion so the gap is visible rather than silent.
 
 ### 5.5 Concurrency and durability
 
@@ -432,6 +440,9 @@ real data; Phase 4 may never be written.
 - **Duplication semantics could change.** If upstream stops re-emitting blocks, dedup becomes
   a no-op — harmless. If it changes `message.id` reuse, totals break; the inflation regression
   test is the tripwire.
+- **All-time `total_messages` covers the transcript era only** (2026-08-13 onward), by the
+  decision in §5.4. Token, session and tool-call totals span both eras. A reader comparing
+  messages against tokens over the full range is comparing different spans.
 - **Day bucketing uses a single fixed UTC offset**, captured at ingest. In a DST zone the
   offset changes twice a year, so messages within an hour of local midnight can land in the
   neighbouring day, and the offset change forces a (non-destructive) rebuild. Accepted:

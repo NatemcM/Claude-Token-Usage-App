@@ -60,20 +60,21 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
 
     // --- Fold in the one-time legacy seed (§5.4) ---
     let mut legacy_sessions: u64 = 0;
-    let mut legacy_messages: u64 = 0;
     let mut legacy_first_date: Option<String> = None;
     let mut legacy_hours: HashMap<String, u64> = HashMap::new();
-    let mut legacy_day_activity: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+    // (session_count, tool_call_count). Message counts are deliberately absent:
+    // the retired cache counted tool results as messages (~3,800/day) while
+    // this pipeline excludes them (~1,620/day), so combining the two would
+    // report a figure mixing two incompatible definitions.
+    let mut legacy_day_activity: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut legacy_day_tokens: BTreeMap<String, HashMap<String, u64>> = BTreeMap::new();
 
     if let Some(legacy) = cache.legacy.as_ref() {
         legacy_sessions = legacy.total_sessions;
-        legacy_messages = legacy.total_messages;
         legacy_first_date = legacy.first_session_date.clone();
         legacy_hours = legacy.hour_counts.clone();
         for (date, d) in &legacy.days {
-            legacy_day_activity
-                .insert(date.clone(), (d.message_count, d.session_count, d.tool_call_count));
+            legacy_day_activity.insert(date.clone(), (d.session_count, d.tool_call_count));
             legacy_day_tokens.insert(date.clone(), d.tokens_by_model.clone());
             days.entry(date.clone()).or_default();
         }
@@ -90,10 +91,11 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
     let daily_activity: Vec<DailyActivity> = days
         .iter()
         .map(|(date, d)| {
-            let (lm, ls, lt) = legacy_day_activity.get(date).copied().unwrap_or((0, 0, 0));
+            let (ls, lt) = legacy_day_activity.get(date).copied().unwrap_or((0, 0));
             DailyActivity {
                 date: date.clone(),
-                message_count: d.message_count + lm,
+                // Live messages only; see legacy_day_activity above.
+                message_count: d.message_count,
                 session_count: d.session_ids.len() as u64 + ls,
                 tool_call_count: d.tool_call_count + lt,
             }
@@ -204,7 +206,9 @@ pub fn to_stats_cache(cache: &UsageCache) -> StatsCache {
         daily_model_tokens,
         model_usage: model_usage_out,
         total_sessions: sessions.len() as u64 + legacy_sessions,
-        total_messages: sessions.values().map(|s| s.message_count).sum::<u64>() + legacy_messages,
+        // Live sessions only: the legacy era's message counter used a different
+        // definition, so its 137,401 are excluded rather than summed in.
+        total_messages: sessions.values().map(|s| s.message_count).sum::<u64>(),
         longest_session,
         first_session_date,
         hour_counts: if hour_counts.is_empty() { None } else { Some(hour_counts) },
@@ -385,6 +389,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_message_counts_are_excluded_even_when_a_day_overlaps() {
+        use crate::usage::legacy::{LegacyDay, LegacyRollup};
+
+        // Same date present in both eras: the live message count must survive
+        // untouched while the legacy one is dropped. Sessions and tool calls
+        // still combine, because those definitions did not change.
+        let mut cache = UsageCache::new(0);
+        cache.files.insert(
+            "/a.jsonl".into(),
+            entry_with("s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 7, 3, 100, 200),
+        );
+
+        let day = LegacyDay {
+            message_count: 5000,
+            session_count: 2,
+            tool_call_count: 11,
+            ..Default::default()
+        };
+        let mut legacy = LegacyRollup {
+            total_messages: 900,
+            total_sessions: 154,
+            ..Default::default()
+        };
+        legacy.days.insert("2026-09-10".to_string(), day);
+        cache.legacy = Some(legacy);
+
+        let stats = to_stats_cache(&cache);
+        let d = stats
+            .daily_activity
+            .iter()
+            .find(|d| d.date == "2026-09-10")
+            .expect("day");
+        assert_eq!(d.message_count, 7, "live 7, legacy 5000 excluded");
+        assert_eq!(d.session_count, 3, "live 1 + legacy 2 still combine");
+        assert_eq!(d.tool_call_count, 14, "live 3 + legacy 11 still combine");
+        assert_eq!(stats.total_messages, 7, "live only");
+        assert_eq!(stats.total_sessions, 155, "live 1 + legacy 154");
+    }
+
+    #[test]
     fn legacy_longest_session_wins_when_larger_than_live() {
         use crate::usage::legacy::LegacyRollup;
         use crate::LongestSession;
@@ -396,13 +440,15 @@ mod tests {
             entry_with("s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 1, 0, 1_000, 2_000),
         );
 
-        let mut legacy = LegacyRollup::default();
-        legacy.longest_session = Some(LongestSession {
-            session_id: "legacy-s".to_string(),
-            duration: 999_999,
-            message_count: 50,
-            timestamp: "2026-01-01".to_string(),
-        });
+        let legacy = LegacyRollup {
+            longest_session: Some(LongestSession {
+                session_id: "legacy-s".to_string(),
+                duration: 999_999,
+                message_count: 50,
+                timestamp: "2026-01-01".to_string(),
+            }),
+            ..Default::default()
+        };
         cache.legacy = Some(legacy);
 
         let stats = to_stats_cache(&cache);
@@ -423,13 +469,15 @@ mod tests {
             entry_with("s1", "2026-09-10", "claude-opus-5", counts(1, 1, 0, 0), 1, 0, 1_000, 501_000),
         );
 
-        let mut legacy = LegacyRollup::default();
-        legacy.longest_session = Some(LongestSession {
-            session_id: "legacy-s".to_string(),
-            duration: 42,
-            message_count: 3,
-            timestamp: "2026-01-01".to_string(),
-        });
+        let legacy = LegacyRollup {
+            longest_session: Some(LongestSession {
+                session_id: "legacy-s".to_string(),
+                duration: 42,
+                message_count: 3,
+                timestamp: "2026-01-01".to_string(),
+            }),
+            ..Default::default()
+        };
         cache.legacy = Some(legacy);
 
         let stats = to_stats_cache(&cache);
@@ -454,15 +502,19 @@ mod tests {
             ),
         );
 
-        let mut legacy = LegacyRollup::default();
-        legacy.total_sessions = 154;
-        legacy.total_messages = 900;
-        legacy.first_session_date = Some("2026-01-25".to_string());
+        let mut legacy = LegacyRollup {
+            total_sessions: 154,
+            total_messages: 900,
+            first_session_date: Some("2026-01-25".to_string()),
+            ..Default::default()
+        };
         legacy.hour_counts.insert("9".to_string(), 40);
-        let mut day = LegacyDay::default();
-        day.message_count = 10;
-        day.session_count = 2;
-        day.tool_call_count = 5;
+        let mut day = LegacyDay {
+            message_count: 10,
+            session_count: 2,
+            tool_call_count: 5,
+            ..Default::default()
+        };
         day.tokens_by_model.insert("claude-opus-4-8".to_string(), 1000);
         legacy.days.insert("2026-01-25".to_string(), day);
         cache.legacy = Some(legacy);
@@ -475,10 +527,18 @@ mod tests {
         let legacy_day = &stats.daily_activity[0];
         assert_eq!(legacy_day.session_count, 2);
         assert_eq!(legacy_day.tool_call_count, 5);
+        assert_eq!(
+            legacy_day.message_count, 0,
+            "a legacy-only day reports no messages rather than old-era counts"
+        );
 
-        // Totals add on top of the live sessions.
+        // Sessions add on top of the live ones...
         assert_eq!(stats.total_sessions, 155, "154 legacy + 1 live");
-        assert_eq!(stats.total_messages, 904, "900 legacy + 4 live");
+        // ...but message counts do NOT. The retired cache counted tool results
+        // as messages (~3,800/day) while this pipeline excludes them
+        // (~1,620/day), so adding the two would report a figure that mixes two
+        // incompatible definitions. Legacy messages are excluded entirely.
+        assert_eq!(stats.total_messages, 4, "live only; legacy's 900 excluded");
         // Earliest date comes from legacy.
         assert_eq!(stats.first_session_date.as_deref(), Some("2026-01-25"));
         assert_eq!(stats.hour_counts.expect("hc")["9"], 40);
