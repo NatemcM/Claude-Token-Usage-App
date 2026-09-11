@@ -33,6 +33,37 @@ pub struct Diagnostics {
     pub projects_root: String,
 }
 
+/// One subagent's contribution to a session. Read-only: subagents have no pid
+/// of their own and cannot be acted on individually.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsage {
+    pub agent_id: String,
+    /// Absent on some subagent records, so genuinely optional.
+    pub agent_type: Option<String>,
+    pub tokens: u64,
+    pub last_ts: i64,
+}
+
+/// Per-session view of the usage cache, merged across every file that belongs
+/// to the session. A session's records live in its own transcript PLUS one file
+/// per subagent, all sharing the parent's sessionId, so a per-file view would
+/// undercount and split the activity timeline.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub first_ts: i64,
+    /// Last record of ANY type: this is what idle age is measured from.
+    pub last_ts: i64,
+    pub message_count: u64,
+    /// Billable total (input + output + cache read + cache creation).
+    pub tokens: u64,
+    pub agents: Vec<AgentUsage>,
+}
+
 /// Minimum gap between cache writes. The cache is ~9.6 MB and transcripts can
 /// change many times a minute, so an ungated persist would write tens of GB a
 /// day under steady activity. Losing a queued write here is cheap: `days` and
@@ -176,6 +207,93 @@ impl UsageWorker {
         }
         self.persist()?;
         Ok(true)
+    }
+
+    /// Per-session usage, keyed by session id, merged across files.
+    pub fn session_usage(&self) -> HashMap<String, SessionUsage> {
+        use std::collections::hash_map::Entry;
+
+        let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: HashMap<String, SessionUsage> = HashMap::new();
+        // agent_id -> (tokens, last_ts, agent_type) per session.
+        let mut agents: HashMap<String, HashMap<String, AgentUsage>> = HashMap::new();
+
+        for entry in guard.files.values() {
+            let sid = &entry.session.session_id;
+            if sid.is_empty() {
+                continue;
+            }
+
+            let tokens: u64 = entry
+                .session
+                .by_model
+                .values()
+                .map(|c| c.billable_total())
+                .sum();
+
+            match out.entry(sid.clone()) {
+                Entry::Vacant(v) => {
+                    v.insert(SessionUsage {
+                        session_id: sid.clone(),
+                        cwd: entry.session.cwd.clone(),
+                        git_branch: entry.session.git_branch.clone(),
+                        first_ts: entry.session.first_ts,
+                        last_ts: entry.session.last_ts,
+                        message_count: entry.session.message_count,
+                        tokens,
+                        agents: Vec::new(),
+                    });
+                }
+                Entry::Occupied(mut o) => {
+                    let s = o.get_mut();
+                    if s.cwd.is_none() {
+                        s.cwd = entry.session.cwd.clone();
+                    }
+                    if s.git_branch.is_none() {
+                        s.git_branch = entry.session.git_branch.clone();
+                    }
+                    if entry.session.first_ts != 0
+                        && (s.first_ts == 0 || entry.session.first_ts < s.first_ts)
+                    {
+                        s.first_ts = entry.session.first_ts;
+                    }
+                    if entry.session.last_ts > s.last_ts {
+                        s.last_ts = entry.session.last_ts;
+                    }
+                    s.message_count += entry.session.message_count;
+                    s.tokens += tokens;
+                }
+            }
+
+            let per_session = agents.entry(sid.clone()).or_default();
+            for (agent_id, a) in &entry.agents {
+                let slot = per_session.entry(agent_id.clone()).or_insert(AgentUsage {
+                    agent_id: agent_id.clone(),
+                    agent_type: a.agent_type.clone(),
+                    tokens: 0,
+                    last_ts: 0,
+                });
+                if slot.agent_type.is_none() {
+                    slot.agent_type = a.agent_type.clone();
+                }
+                slot.tokens += a.tokens.billable_total();
+                if a.last_ts > slot.last_ts {
+                    slot.last_ts = a.last_ts;
+                }
+            }
+        }
+
+        for (sid, per_session) in agents {
+            if let Some(s) = out.get_mut(&sid) {
+                let mut list: Vec<AgentUsage> = per_session.into_values().collect();
+                // Most recently active first — that is the useful ordering when
+                // asking "what is this session doing right now".
+                list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+                s.agents = list;
+            }
+        }
+
+        out
     }
 }
 
@@ -436,5 +554,161 @@ mod tests {
             .find(|d| d.date == "2026-09-10")
             .expect("day");
         assert_eq!(day.tokens_by_model["claude-opus-5"], 10, "must not multiply");
+    }
+
+    #[test]
+    fn session_usage_merges_a_session_split_across_parent_and_subagent_files() {
+        use crate::usage::types::{AgentRollup, FileEntry, TokenCounts, UsageCache};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = resolve_with(Some(dir.path().join("claude")), None, None);
+        let worker = UsageWorker::new(roots, dir.path().join("cache/c.json"));
+
+        // Hand-build a cache: one session across two files, plus an unrelated one.
+        {
+            let mut guard = worker.cache.lock().expect("lock");
+            *guard = UsageCache::new(0);
+
+            let mut parent = FileEntry::default();
+            parent.session.session_id = "s-1".to_string();
+            parent.session.cwd = Some("/p/proj".to_string());
+            parent.session.git_branch = Some("main".to_string());
+            parent.session.first_ts = 1_000;
+            parent.session.last_ts = 5_000;
+            parent.session.message_count = 4;
+            parent.session.by_model.insert(
+                "claude-opus-5".to_string(),
+                TokenCounts { input: 1, output: 2, cache_read: 3, cache_creation: 4, ..Default::default() },
+            );
+
+            let mut sub = FileEntry::default();
+            sub.session.session_id = "s-1".to_string(); // same session!
+            sub.session.first_ts = 2_000;
+            sub.session.last_ts = 9_000;               // later than the parent
+            sub.session.message_count = 3;
+            sub.session.by_model.insert(
+                "claude-sonnet-5".to_string(),
+                TokenCounts { input: 10, output: 20, ..Default::default() },
+            );
+            sub.agents.insert(
+                "a1".to_string(),
+                AgentRollup {
+                    agent_id: "a1".to_string(),
+                    agent_type: Some("Explore".to_string()),
+                    last_ts: 8_000,
+                    tokens: TokenCounts { output: 50, ..Default::default() },
+                },
+            );
+
+            let mut other = FileEntry::default();
+            other.session.session_id = "s-2".to_string();
+            other.session.last_ts = 7_000;
+
+            guard.files.insert("/parent.jsonl".into(), parent);
+            guard.files.insert("/parent/subagents/a.jsonl".into(), sub);
+            guard.files.insert("/other.jsonl".into(), other);
+        }
+
+        let usage = worker.session_usage();
+        assert_eq!(usage.len(), 2, "two distinct sessions");
+
+        let s1 = usage.get("s-1").expect("s-1");
+        assert_eq!(s1.first_ts, 1_000, "earliest across both files");
+        assert_eq!(s1.last_ts, 9_000, "latest across both files");
+        assert_eq!(s1.message_count, 7, "4 + 3");
+        // billable totals: (1+2+3+4) + (10+20) = 10 + 30
+        assert_eq!(s1.tokens, 40);
+        assert_eq!(s1.cwd.as_deref(), Some("/p/proj"));
+        assert_eq!(s1.git_branch.as_deref(), Some("main"));
+        assert_eq!(s1.agents.len(), 1);
+        assert_eq!(s1.agents[0].agent_id, "a1");
+        assert_eq!(s1.agents[0].agent_type.as_deref(), Some("Explore"));
+        assert_eq!(s1.agents[0].tokens, 50);
+        assert_eq!(s1.agents[0].last_ts, 8_000);
+    }
+
+    #[test]
+    fn session_usage_merges_one_agent_appearing_in_two_files() {
+        use crate::usage::types::{AgentRollup, FileEntry, TokenCounts, UsageCache};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = resolve_with(Some(dir.path().join("claude")), None, None);
+        let worker = UsageWorker::new(roots, dir.path().join("cache/c.json"));
+
+        {
+            let mut guard = worker.cache.lock().expect("lock");
+            *guard = UsageCache::new(0);
+            for (path, tokens, last) in [("/a.jsonl", 10u64, 100i64), ("/b.jsonl", 5, 300)] {
+                let mut e = FileEntry::default();
+                e.session.session_id = "s-1".to_string();
+                e.agents.insert(
+                    "a1".to_string(),
+                    AgentRollup {
+                        agent_id: "a1".to_string(),
+                        agent_type: None,
+                        last_ts: last,
+                        tokens: TokenCounts { output: tokens, ..Default::default() },
+                    },
+                );
+                guard.files.insert(path.into(), e);
+            }
+        }
+
+        let usage = worker.session_usage();
+        let agents = &usage.get("s-1").expect("s-1").agents;
+        assert_eq!(agents.len(), 1, "same agent_id must merge, not duplicate");
+        assert_eq!(agents[0].tokens, 15);
+        assert_eq!(agents[0].last_ts, 300, "latest wins");
+    }
+
+    #[test]
+    fn session_usage_skips_entries_with_no_session_id() {
+        use crate::usage::types::{FileEntry, UsageCache};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = resolve_with(Some(dir.path().join("claude")), None, None);
+        let worker = UsageWorker::new(roots, dir.path().join("cache/c.json"));
+        {
+            let mut guard = worker.cache.lock().expect("lock");
+            *guard = UsageCache::new(0);
+            guard.files.insert("/empty.jsonl".into(), FileEntry::default());
+        }
+        assert!(worker.session_usage().is_empty());
+    }
+
+    #[test]
+    fn session_usage_sorts_agents_by_last_activity_descending() {
+        use crate::usage::types::{AgentRollup, FileEntry, TokenCounts, UsageCache};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = resolve_with(Some(dir.path().join("claude")), None, None);
+        let worker = UsageWorker::new(roots, dir.path().join("cache/c.json"));
+        {
+            let mut guard = worker.cache.lock().expect("lock");
+            *guard = UsageCache::new(0);
+            let mut e = FileEntry::default();
+            e.session.session_id = "s-1".to_string();
+            for (id, last) in [("old", 100i64), ("newest", 900), ("mid", 500)] {
+                e.agents.insert(
+                    id.to_string(),
+                    AgentRollup {
+                        agent_id: id.to_string(),
+                        agent_type: None,
+                        last_ts: last,
+                        tokens: TokenCounts::default(),
+                    },
+                );
+            }
+            guard.files.insert("/a.jsonl".into(), e);
+        }
+        let ids: Vec<String> = worker
+            .session_usage()
+            .get("s-1")
+            .expect("s-1")
+            .agents
+            .iter()
+            .map(|a| a.agent_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["newest", "mid", "old"], "most recent first");
     }
 }
