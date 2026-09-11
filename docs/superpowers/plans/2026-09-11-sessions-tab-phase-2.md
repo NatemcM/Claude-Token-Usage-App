@@ -43,7 +43,7 @@
 | `src-tauri/src/lib.rs` | **Modified:** new commands, tray session count |
 | `src/components/SessionsList.svelte` | Grouped Live/Stale list, polling lifecycle |
 | `src/components/SessionRow.svelte` | One row plus its nested subagent rows |
-| `src/App.svelte` | **Modified:** three-tab shell |
+| `src/App.svelte` | **Modified:** two tabs plus a full-screen Settings overlay |
 | `src/components/Settings.svelte` | **Modified:** tray toggle |
 | `src/lib/api.ts`, `src/lib/types.ts` | **Modified:** new commands and types |
 | `CLAUDE.md` | **Modified:** record the sysinfo toolchain pin |
@@ -62,7 +62,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `ProcInfo { start_time_secs, exe_basename, argv0 }`, `trait ProcessProbe { fn probe(&self, pids: &[u32]) -> HashMap<u32, ProcInfo> }`, `SysinfoProbe`, `FakeProbe` (with `alive(pid, start_time_secs, exe_basename)` and `dead(pid)` builders).
+- Produces: `ProcInfo { start_time_secs, exe_basename }`, `trait ProcessProbe { fn probe(&self, pids: &[u32]) -> HashMap<u32, ProcInfo> }`, `SysinfoProbe::new()`, `FakeProbe` (test-only; `alive(pid, start_time_secs, exe_basename)` and `dead(pid)` builders).
 
 **Why a trait:** every later task needs to answer "is this pid alive and is it the process the registry thinks it is". Doing that against real processes in tests would make them machine-dependent and, once Phase 3 lands, dangerous. `probe()` takes the pid list and returns only the LIVE ones, so absence means dead — there is no separate `is_alive` to fall out of sync.
 
@@ -82,7 +82,13 @@ Then add this bullet to the "Known Issues & Gotchas" list in `CLAUDE.md`, next t
 
 - [ ] **Step 2: Write the failing test**
 
-Create `src-tauri/src/sessions/probe.rs` with ONLY this test module:
+First wire the module in, so the test is actually part of the crate and the
+next step fails with a type error rather than silently running zero tests.
+Create `src-tauri/src/sessions/mod.rs` containing `pub mod probe;`, and add
+`mod sessions;` to `src-tauri/src/lib.rs` beside the existing `mod usage;` and
+`mod config;`.
+
+Then create `src-tauri/src/sessions/probe.rs` with ONLY this test module:
 
 ```rust
 #[cfg(test)]
@@ -116,7 +122,7 @@ mod tests {
     fn sysinfo_probe_finds_our_own_process_and_not_a_bogus_pid() {
         // The one test that touches real processes. It only inspects; it never
         // signals. Our own pid is guaranteed alive, so this is not flaky.
-        let probe = SysinfoProbe;
+        let probe = SysinfoProbe::new();
         let me = std::process::id();
         let got = probe.probe(&[me, 999_999]);
 
@@ -151,11 +157,11 @@ pub struct ProcInfo {
     /// `startedAt / 1000` — no timezone parsing, which is the whole reason we
     /// use this rather than the `procStart` string.
     pub start_time_secs: i64,
-    /// Basename of the executable, e.g. "claude" or "node".
+    /// Basename of the executable, e.g. "claude" or "node". Phase 2 does not
+    /// gate on it — start-time identity is the strong check — but it makes the
+    /// real-process test meaningful and Phase 3 will use it to REFUSE a
+    /// clearly-wrong process.
     pub exe_basename: Option<String>,
-    /// argv[0], which for an npm-global install is the node binary rather
-    /// than claude. Recorded for Phase 3/4; unused here.
-    pub argv0: Option<String>,
 }
 
 /// Read-only view of process state. Behind a trait so tests never depend on
@@ -166,25 +172,46 @@ pub trait ProcessProbe: Send + Sync {
 }
 
 /// The real implementation.
-pub struct SysinfoProbe;
+///
+/// Holds ONE `System` for the life of the probe. `System::new()` acquires a
+/// mach port on macOS which sysinfo 0.35 never releases, and this probe is
+/// called on every UI poll (~30/min) plus every tray update — so constructing
+/// one per call would leak a port reference each time.
+pub struct SysinfoProbe {
+    sys: std::sync::Mutex<sysinfo::System>,
+}
+
+impl SysinfoProbe {
+    pub fn new() -> Self {
+        SysinfoProbe {
+            sys: std::sync::Mutex::new(sysinfo::System::new()),
+        }
+    }
+}
+
+impl Default for SysinfoProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ProcessProbe for SysinfoProbe {
     fn probe(&self, pids: &[u32]) -> HashMap<u32, ProcInfo> {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
         if pids.is_empty() {
             return HashMap::new();
         }
         let wanted: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
 
-        let mut sys = System::new();
-        // Refresh only these pids, and only the fields we read.
+        let mut sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+        // Refresh only these pids, and only the field we read. The `true`
+        // prunes requested pids that have since died, so a reused `System`
+        // cannot report a stale process as alive.
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&wanted),
             true,
-            ProcessRefreshKind::nothing()
-                .with_exe(UpdateKind::Always)
-                .with_cmd(UpdateKind::Always),
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
         );
 
         let mut out = HashMap::new();
@@ -200,10 +227,6 @@ impl ProcessProbe for SysinfoProbe {
                         .exe()
                         .and_then(|e| e.file_name())
                         .map(|n| n.to_string_lossy().to_string()),
-                    argv0: p
-                        .cmd()
-                        .first()
-                        .map(|s| s.to_string_lossy().to_string()),
                 },
             );
         }
@@ -212,11 +235,15 @@ impl ProcessProbe for SysinfoProbe {
 }
 
 /// Test double. Build with `.alive(..)` / `.dead(..)`.
+/// `#[cfg(test)]` because nothing in the shipping binary constructs it, and
+/// without the gate clippy reports its three builders as dead code.
+#[cfg(test)]
 #[derive(Default)]
 pub struct FakeProbe {
     live: HashMap<u32, ProcInfo>,
 }
 
+#[cfg(test)]
 impl FakeProbe {
     pub fn new() -> Self {
         FakeProbe::default()
@@ -228,7 +255,6 @@ impl FakeProbe {
             ProcInfo {
                 start_time_secs,
                 exe_basename: Some(exe_basename.to_string()),
-                argv0: Some(format!("/usr/local/bin/{}", exe_basename)),
             },
         );
         self
@@ -240,6 +266,7 @@ impl FakeProbe {
     }
 }
 
+#[cfg(test)]
 impl ProcessProbe for FakeProbe {
     fn probe(&self, pids: &[u32]) -> HashMap<u32, ProcInfo> {
         pids.iter()
@@ -249,13 +276,7 @@ impl ProcessProbe for FakeProbe {
 }
 ```
 
-Create `src-tauri/src/sessions/mod.rs`:
-
-```rust
-pub mod probe;
-```
-
-Add `mod sessions;` to `src-tauri/src/lib.rs` beside the existing `mod usage;` and `mod config;`.
+(`mod.rs` and the `mod sessions;` line were added in Step 2.)
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -294,7 +315,9 @@ the toolchain here is 1.86. Recorded in CLAUDE.md."
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `SessionFile { pid, session_id, cwd, started_at_ms, version, kind, entrypoint, pid_domain, name, messaging_socket_path }`, `read_registry(&Path) -> Vec<SessionFile>`.
+- Produces: `SessionFile { pid, session_id, started_at_ms, cwd, version, entrypoint, pid_domain, name, messaging_socket_path }`, `read_registry(&Path) -> Vec<SessionFile>`.
+
+`kind` is present in the real JSON but nothing in Phase 2 renders it, so it is deliberately not carried — an unread field trips clippy's dead-code lint.
 
 **Real shape** (all keys observed on this machine; `updatedAt`, `nameSince`, `nameSource`, `peerProtocol`, `peerFeatures`, `bridgeSessionId` also appear and are ignored):
 
@@ -308,7 +331,9 @@ the toolchain here is 1.86. Recorded in CLAUDE.md."
 
 - [ ] **Step 1: Write the failing test**
 
-Create `src-tauri/src/sessions/registry.rs` with ONLY this test module:
+Add `pub mod registry;` to `src-tauri/src/sessions/mod.rs` FIRST, so the next
+step fails with a missing-function error rather than running zero tests. Then
+create `src-tauri/src/sessions/registry.rs` with ONLY this test module:
 
 ```rust
 #[cfg(test)]
@@ -344,7 +369,6 @@ mod tests {
         assert_eq!(s.cwd.as_deref(), Some("/Users/me/Projects/claude-token-usage"));
         assert_eq!(s.started_at_ms, 1789029119710);
         assert_eq!(s.version.as_deref(), Some("2.1.267"));
-        assert_eq!(s.kind.as_deref(), Some("interactive"));
         assert_eq!(s.entrypoint.as_deref(), Some("claude-vscode"));
         assert_eq!(s.pid_domain.as_deref(), Some("darwin"));
         assert_eq!(s.name.as_deref(), Some("claude-token-usage-32"));
@@ -431,7 +455,6 @@ pub struct SessionFile {
     pub started_at_ms: i64,
     pub cwd: Option<String>,
     pub version: Option<String>,
-    pub kind: Option<String>,
     pub entrypoint: Option<String>,
     pub pid_domain: Option<String>,
     pub name: Option<String>,
@@ -447,7 +470,6 @@ struct RawSession {
     started_at: Option<i64>,
     cwd: Option<String>,
     version: Option<String>,
-    kind: Option<String>,
     entrypoint: Option<String>,
     #[serde(rename = "pidDomain")]
     pid_domain: Option<String>,
@@ -489,7 +511,6 @@ pub fn read_registry(sessions_dir: &Path) -> Vec<SessionFile> {
             started_at_ms,
             cwd: raw.cwd,
             version: raw.version,
-            kind: raw.kind,
             entrypoint: raw.entrypoint,
             pid_domain: raw.pid_domain,
             name: raw.name,
@@ -502,7 +523,7 @@ pub fn read_registry(sessions_dir: &Path) -> Vec<SessionFile> {
 }
 ```
 
-Add `pub mod registry;` to `src-tauri/src/sessions/mod.rs`.
+(The `mod` line was added in Step 1.)
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -530,13 +551,16 @@ git commit -m "feat(sessions): read the session registry tolerantly"
 
 **Interfaces:**
 - Consumes: `SessionFile` (Task 2), `ProcessProbe`/`FakeProbe` (Task 1).
-- Produces: `SessionState { Live, Stale }`, `Reconciled { file: SessionFile, state: SessionState, start_time_secs: Option<i64> }`, `START_TIME_TOLERANCE_SECS`, `reconcile(&[SessionFile], &dyn ProcessProbe) -> Vec<Reconciled>`.
+- Produces: `SessionState { Live, Stale }`, `Reconciled { file: SessionFile, state: SessionState }`, `START_TIME_TOLERANCE_SECS`, `reconcile(&[SessionFile], &dyn ProcessProbe) -> Vec<Reconciled>`.
+
+The matched process start time is deliberately NOT carried on `Reconciled`: nothing downstream reads it (uptime comes from `startedAt`, the session's own record), and an unread field trips clippy's dead-code lint.
 
 **The identity rule:** a session is `Live` only when its pid is alive AND `|start_time_secs - started_at_ms/1000| <= 120`. Measured skew on six real sessions was 0–8 s, so 120 s is generous while still rejecting a recycled pid — a different process that inherited the number will almost never have started within two minutes of the recorded session.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `src-tauri/src/sessions/reconcile.rs` with ONLY this test module:
+Add `pub mod reconcile;` to `src-tauri/src/sessions/mod.rs` FIRST. Then create
+`src-tauri/src/sessions/reconcile.rs` with ONLY this test module:
 
 ```rust
 #[cfg(test)]
@@ -567,7 +591,6 @@ mod tests {
         let got = reconcile(&files, &probe);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].state, SessionState::Live);
-        assert_eq!(got[0].start_time_secs, Some(1_789_000_000));
     }
 
     #[test]
@@ -584,7 +607,6 @@ mod tests {
         let probe = FakeProbe::new(); // nothing alive
         let got = reconcile(&files, &probe);
         assert_eq!(got[0].state, SessionState::Stale);
-        assert_eq!(got[0].start_time_secs, None);
     }
 
     #[test]
@@ -699,8 +721,6 @@ pub enum SessionState {
 pub struct Reconciled {
     pub file: SessionFile,
     pub state: SessionState,
-    /// The live process's start time, when there is one.
-    pub start_time_secs: Option<i64>,
 }
 
 /// Classify every registered session against live process state. Input order
@@ -732,20 +752,13 @@ pub fn reconcile(files: &[SessionFile], probe: &dyn ProcessProbe) -> Vec<Reconci
                 } else {
                     SessionState::Stale
                 },
-                start_time_secs: if matches {
-                    info.map(|i| i.start_time_secs)
-                } else {
-                    None
-                },
             }
         })
         .collect()
 }
 ```
 
-Add `pub mod reconcile;` to `src-tauri/src/sessions/mod.rs`.
-
-Note: `is_some_and` is stable in rustc 1.86; if the build complains, use `map_or(false, |i| ...)`.
+(The `mod` line was added in Step 1.) `is_some_and` has been stable since rustc 1.70.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1108,7 +1121,8 @@ git commit -m "feat(usage): expose per-session usage merged across files"
 
 - [ ] **Step 1: Write the failing test**
 
-Create `src-tauri/src/sessions/rows.rs` with ONLY this test module:
+Add `pub mod rows;` to `src-tauri/src/sessions/mod.rs` FIRST. Then create
+`src-tauri/src/sessions/rows.rs` with ONLY this test module:
 
 ```rust
 #[cfg(test)]
@@ -1135,10 +1149,6 @@ mod tests {
                 messaging_socket_path: Some(format!("/tmp/cc-socks/{pid}.sock")),
             },
             state,
-            start_time_secs: match state {
-                SessionState::Live => Some(started_ms / 1000),
-                SessionState::Stale => None,
-            },
         }
     }
 
@@ -1449,7 +1459,7 @@ pub fn build_rows(
 }
 ```
 
-Add `pub mod rows;` to `src-tauri/src/sessions/mod.rs`.
+(The `mod` line was added in Step 1.)
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1479,145 +1489,219 @@ This is the only code in Phase 2 that writes anything under `~/.claude`. It dele
 
 **Interfaces:**
 - Consumes: `SessionFile` (Task 2), `ProcessProbe` (Task 1).
-- Produces: `RemovalOutcome { removed: Vec<PathBuf>, skipped: Vec<String> }`, `remove_registration(&Path, u32, &dyn ProcessProbe) -> Result<RemovalOutcome, String>`.
+- Produces: `RemovalOutcome { removed: Vec<PathBuf>, skipped: Vec<String> }`, `remove_registration(&Path, u32, &dyn ProcessProbe) -> Result<RemovalOutcome, String>`, and the seam `remove_registration_in(&Path, u32, &dyn ProcessProbe, &Path) -> Result<RemovalOutcome, String>`.
 
 **Safety rules, all tested:**
 1. Re-read the session file and **re-verify the pid is dead** at call time. A session that came back to life between the UI render and the click must be refused.
-2. Delete only: `<sessions_dir>/<pid>.json`, any `<sessions_dir>/<pid>.<hex>.key`, and the socket path **declared by that session's own JSON** and only if it sits under `/tmp/cc-socks/`.
-3. Never touch a directory, never glob beyond the `<pid>.` prefix, never follow a socket path elsewhere on disk.
+2. **Refuse a non-darwin `pidDomain`.** `reconcile` filters those out of the UI, but this command is callable directly; a foreign pid number probed locally would look dead and we would delete another machine's registration.
+3. Delete only: `<sessions_dir>/<pid>.json`, any `<sessions_dir>/<pid>.<hex>.key`, and a socket that is **declared by that session's own JSON**, named exactly `<pid>.sock`, and sitting directly in the socket directory.
+4. Never touch a directory, never glob beyond the `<pid>.` first dot-component, never follow a symlink.
+
+**The socket is a socket, not a file.** Real entries in `/tmp/cc-socks` are Unix domain sockets — `srw-------`, so `S_ISSOCK` is true and `S_ISREG` is FALSE. A removal guard written as `metadata.is_file()` therefore refuses every real socket while passing any test that creates the fixture with `fs::write`. The `.json`/`.key` paths keep the strict regular-file rule; the declared socket accepts a socket type as well, and the test binds a real `UnixListener` so the fixture cannot hide the bug.
+
+**The socket directory is injectable** so tests never touch the real `/tmp/cc-socks`, where they could collide with a live session's socket or with a parallel test run.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `src-tauri/src/sessions/registration.rs` with ONLY this test module:
+Add `pub mod registration;` to `src-tauri/src/sessions/mod.rs` FIRST. Then
+create `src-tauri/src/sessions/registration.rs` with ONLY this test module:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sessions::probe::FakeProbe;
+    use std::path::{Path, PathBuf};
 
-    fn setup(dir: &std::path::Path, pid: u32, sock: Option<&str>) {
-        std::fs::create_dir_all(dir).expect("mkdir");
+    /// Writes a registration, its .key sibling, and returns (sessions_dir, socket_dir).
+    fn setup(root: &Path, pid: u32, sock: Option<&str>) -> (PathBuf, PathBuf) {
+        let sessions = root.join("sessions");
+        let socks = root.join("socks");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        std::fs::create_dir_all(&socks).expect("mkdir socks");
         let sock_line = sock
             .map(|s| format!(r#","messagingSocketPath":"{s}""#))
             .unwrap_or_default();
         std::fs::write(
-            dir.join(format!("{pid}.json")),
+            sessions.join(format!("{pid}.json")),
             format!(
                 r#"{{"pid":{pid},"sessionId":"s-{pid}","startedAt":1789000000000,"pidDomain":"darwin"{sock_line}}}"#
             ),
         )
         .expect("write json");
-        std::fs::write(dir.join(format!("{pid}.abc123def456.key")), "secret").expect("write key");
+        std::fs::write(sessions.join(format!("{pid}.abc123def456.key")), "secret")
+            .expect("write key");
+        (sessions, socks)
+    }
+
+    /// Bind a REAL Unix domain socket. The path survives the listener being
+    /// dropped, which is exactly the leftover state we are cleaning up.
+    fn bind_socket(path: &Path) {
+        let l = std::os::unix::net::UnixListener::bind(path).expect("bind socket");
+        drop(l);
+        let md = std::fs::symlink_metadata(path).expect("stat");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(md.file_type().is_socket(), "fixture must be a real socket");
+        assert!(!md.is_file(), "a socket is not a regular file - that is the point");
     }
 
     #[test]
     fn removes_the_json_and_key_of_a_dead_session() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        setup(&dir, 4242, None);
+        let (sessions, socks) = setup(tmp.path(), 4242, None);
 
-        let out = remove_registration(&dir, 4242, &FakeProbe::new()).expect("ok");
+        let out = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
 
-        assert!(!dir.join("4242.json").exists());
-        assert!(!dir.join("4242.abc123def456.key").exists());
+        assert!(!sessions.join("4242.json").exists());
+        assert!(!sessions.join("4242.abc123def456.key").exists());
         assert_eq!(out.removed.len(), 2);
+    }
+
+    #[test]
+    fn removes_a_real_unix_socket_declared_by_the_session() {
+        // The regression test for the socket type. A guard that only accepts
+        // regular files refuses this and the feature silently does nothing.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socks = tmp.path().join("socks");
+        std::fs::create_dir_all(&socks).expect("mkdir");
+        let sock = socks.join("4242.sock");
+        let (sessions, _) = setup(tmp.path(), 4242, Some(sock.to_str().expect("utf8")));
+        bind_socket(&sock);
+
+        let out = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
+
+        assert!(!sock.exists(), "the session's own socket must be removed");
+        assert_eq!(out.removed.len(), 3, "json + key + socket");
+        assert!(out.skipped.is_empty(), "unexpected skips: {:?}", out.skipped);
     }
 
     #[test]
     fn refuses_when_the_pid_is_actually_alive() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        setup(&dir, 4242, None);
+        let (sessions, socks) = setup(tmp.path(), 4242, None);
 
         // startedAt in the fixture is 1789000000000 -> 1789000000s.
         let probe = FakeProbe::new().alive(4242, 1_789_000_000, "claude");
-        let err = remove_registration(&dir, 4242, &probe).expect_err("must refuse");
+        let err = remove_registration_in(&sessions, 4242, &probe, &socks).expect_err("must refuse");
 
         assert!(err.to_lowercase().contains("alive"), "unhelpful error: {err}");
-        assert!(dir.join("4242.json").exists(), "nothing may be deleted on refusal");
-        assert!(dir.join("4242.abc123def456.key").exists());
+        assert!(sessions.join("4242.json").exists(), "nothing may be deleted on refusal");
+        assert!(sessions.join("4242.abc123def456.key").exists());
     }
 
     #[test]
-    fn removes_a_declared_socket_only_when_it_lives_under_cc_socks() {
+    fn refuses_a_non_darwin_pid_domain() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        let socks = std::path::Path::new("/tmp/cc-socks");
-        std::fs::create_dir_all(socks).expect("mkdir socks");
-        let sock = socks.join("4242.sock");
-        std::fs::write(&sock, b"").expect("write sock");
-        setup(&dir, 4242, Some(sock.to_str().expect("utf8")));
+        let sessions = tmp.path().join("sessions");
+        let socks = tmp.path().join("socks");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        std::fs::create_dir_all(&socks).expect("mkdir");
+        std::fs::write(
+            sessions.join("4242.json"),
+            r#"{"pid":4242,"sessionId":"s","startedAt":1789000000000,"pidDomain":"linux"}"#,
+        )
+        .expect("write");
 
-        let out = remove_registration(&dir, 4242, &FakeProbe::new()).expect("ok");
-        assert!(!sock.exists(), "the session's own socket should go");
-        assert_eq!(out.removed.len(), 3);
+        let err = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks)
+            .expect_err("must refuse a foreign pid namespace");
+        assert!(err.to_lowercase().contains("domain"), "unhelpful error: {err}");
+        assert!(sessions.join("4242.json").exists());
     }
 
     #[test]
-    fn refuses_a_socket_path_outside_cc_socks_and_reports_it() {
+    fn refuses_a_socket_path_outside_the_socket_dir_and_reports_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
         let decoy = tmp.path().join("important.txt");
         std::fs::write(&decoy, b"do not delete me").expect("write");
-        setup(&dir, 4242, Some(decoy.to_str().expect("utf8")));
+        let (sessions, socks) = setup(tmp.path(), 4242, Some(decoy.to_str().expect("utf8")));
 
-        let out = remove_registration(&dir, 4242, &FakeProbe::new()).expect("ok");
+        let out = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
 
-        assert!(decoy.exists(), "a socket path outside /tmp/cc-socks must be refused");
+        assert!(decoy.exists(), "a path outside the socket dir must be refused");
         assert_eq!(out.skipped.len(), 1);
         assert!(out.skipped[0].contains("important.txt"));
-        // The registration itself still goes.
-        assert!(!dir.join("4242.json").exists());
+        assert!(!sessions.join("4242.json").exists(), "the registration still goes");
+    }
+
+    #[test]
+    fn refuses_a_traversal_attempt_in_the_declared_socket_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"keep me").expect("write");
+        let socks = tmp.path().join("socks");
+        std::fs::create_dir_all(&socks).expect("mkdir");
+        // A path that lexically sits under socks but climbs back out.
+        let evil = format!("{}/../victim.txt", socks.display());
+        let (sessions, _) = setup(tmp.path(), 4242, Some(&evil));
+
+        let out = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
+
+        assert!(victim.exists(), "traversal must not escape the socket dir");
+        assert_eq!(out.skipped.len(), 1);
+    }
+
+    #[test]
+    fn refuses_a_socket_whose_name_is_not_the_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socks = tmp.path().join("socks");
+        std::fs::create_dir_all(&socks).expect("mkdir");
+        let other = socks.join("9999.sock");
+        bind_socket(&other);
+        let (sessions, _) = setup(tmp.path(), 4242, Some(other.to_str().expect("utf8")));
+
+        let out = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
+
+        assert!(other.exists(), "only <pid>.sock may be removed");
+        assert_eq!(out.skipped.len(), 1);
     }
 
     #[test]
     fn does_not_touch_another_sessions_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        setup(&dir, 4242, None);
-        setup(&dir, 5555, None);
+        let (sessions, socks) = setup(tmp.path(), 4242, None);
+        setup(tmp.path(), 5555, None);
 
-        remove_registration(&dir, 4242, &FakeProbe::new()).expect("ok");
+        remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
 
-        assert!(dir.join("5555.json").exists(), "a neighbour must survive");
-        assert!(dir.join("5555.abc123def456.key").exists());
+        assert!(sessions.join("5555.json").exists(), "a neighbour must survive");
+        assert!(sessions.join("5555.abc123def456.key").exists());
     }
 
     #[test]
     fn a_pid_prefix_must_not_match_a_longer_pid() {
         // 424 must not sweep up 4242's files.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        setup(&dir, 4242, None);
-        setup(&dir, 424, None);
+        let (sessions, socks) = setup(tmp.path(), 4242, None);
+        setup(tmp.path(), 424, None);
 
-        remove_registration(&dir, 424, &FakeProbe::new()).expect("ok");
+        remove_registration_in(&sessions, 424, &FakeProbe::new(), &socks).expect("ok");
 
-        assert!(!dir.join("424.json").exists());
-        assert!(dir.join("4242.json").exists(), "4242 is a different session");
-        assert!(dir.join("4242.abc123def456.key").exists());
+        assert!(!sessions.join("424.json").exists());
+        assert!(sessions.join("4242.json").exists(), "4242 is a different session");
+        assert!(sessions.join("4242.abc123def456.key").exists());
     }
 
     #[test]
     fn refuses_an_unknown_pid_rather_than_deleting_nothing_silently() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let err = remove_registration(&dir, 9999, &FakeProbe::new()).expect_err("must refuse");
+        let sessions = tmp.path().join("sessions");
+        let socks = tmp.path().join("socks");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        std::fs::create_dir_all(&socks).expect("mkdir");
+        let err = remove_registration_in(&sessions, 9999, &FakeProbe::new(), &socks)
+            .expect_err("must refuse");
         assert!(err.to_lowercase().contains("no registration"), "unhelpful error: {err}");
     }
 
     #[test]
     fn never_removes_a_directory_even_if_one_is_named_like_a_key() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("sessions");
-        setup(&dir, 4242, None);
-        let trap = dir.join("4242.trap.key");
+        let (sessions, socks) = setup(tmp.path(), 4242, None);
+        let trap = sessions.join("4242.trap.key");
         std::fs::create_dir_all(&trap).expect("mkdir trap");
         std::fs::write(trap.join("inside"), b"x").expect("write");
 
-        let out = remove_registration(&dir, 4242, &FakeProbe::new()).expect("ok");
+        let out = remove_registration_in(&sessions, 4242, &FakeProbe::new(), &socks).expect("ok");
 
         assert!(trap.exists(), "a directory must never be removed");
         assert!(trap.join("inside").exists());
@@ -1642,10 +1726,12 @@ Prepend to `src-tauri/src/sessions/registration.rs`:
 use crate::sessions::probe::ProcessProbe;
 use crate::sessions::reconcile::START_TIME_TOLERANCE_SECS;
 use crate::sessions::registry::read_registry;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-/// Sockets may only be removed from this directory. Anything else named in a
-/// session file is refused and reported.
+/// Sockets may only be removed from this directory in production. Tests pass
+/// their own via `remove_registration_in` so they never touch the real one,
+/// where they could collide with a live session or a parallel test run.
 const SOCKET_DIR: &str = "/tmp/cc-socks";
 
 #[derive(Debug, Default)]
@@ -1656,20 +1742,43 @@ pub struct RemovalOutcome {
 }
 
 /// Remove the registration files of a session whose process is gone.
-///
-/// This is the only write under `~/.claude` in Phase 2, so it re-verifies
-/// liveness at call time rather than trusting the row the user clicked: a
-/// session that came back between render and click must not have its files
-/// deleted out from under it.
 pub fn remove_registration(
     sessions_dir: &Path,
     pid: u32,
     probe: &dyn ProcessProbe,
 ) -> Result<RemovalOutcome, String> {
+    remove_registration_in(sessions_dir, pid, probe, Path::new(SOCKET_DIR))
+}
+
+/// Testable form: the socket directory is a parameter.
+///
+/// This is the only write under `~/.claude` in Phase 2, so it re-verifies
+/// liveness at call time rather than trusting the row the user clicked: a
+/// session that came back between render and click must not have its files
+/// deleted out from under it.
+pub fn remove_registration_in(
+    sessions_dir: &Path,
+    pid: u32,
+    probe: &dyn ProcessProbe,
+    socket_dir: &Path,
+) -> Result<RemovalOutcome, String> {
     let entry = read_registry(sessions_dir)
         .into_iter()
         .find(|s| s.pid == pid)
         .ok_or_else(|| format!("no registration found for pid {pid}"))?;
+
+    // A pid from another machine's namespace would look dead locally. Refuse
+    // rather than delete a registration we cannot reason about.
+    if entry
+        .pid_domain
+        .as_deref()
+        .is_some_and(|d| d != "darwin")
+    {
+        return Err(format!(
+            "pid {pid} belongs to another pid domain ({}); refusing",
+            entry.pid_domain.as_deref().unwrap_or("unknown")
+        ));
+    }
 
     // Re-verify: alive AND the same session (start times agree).
     if let Some(info) = probe.probe(&[pid]).get(&pid) {
@@ -1684,13 +1793,11 @@ pub fn remove_registration(
 
     let mut out = RemovalOutcome::default();
 
-    // 1. The registration JSON.
-    let json = sessions_dir.join(format!("{pid}.json"));
-    remove_file_only(&json, &mut out);
+    // 1. The registration JSON. Regular files only.
+    remove_regular_file(&sessions_dir.join(format!("{pid}.json")), &mut out);
 
-    // 2. Key siblings: exactly `<pid>.<something>.key`. The `<pid>.` prefix
-    //    check is on the full first dot-separated component so 424 cannot
-    //    match 4242.
+    // 2. Key siblings: exactly `<pid>.<something>.key`. Comparing the whole
+    //    first dot-component means 424 cannot match 4242.
     if let Ok(entries) = std::fs::read_dir(sessions_dir) {
         for e in entries.flatten() {
             let path = e.path();
@@ -1700,57 +1807,83 @@ pub fn remove_registration(
             if !name.ends_with(".key") {
                 continue;
             }
-            let first = name.split('.').next().unwrap_or("");
-            if first != pid.to_string() {
+            if name.split('.').next().unwrap_or("") != pid.to_string() {
                 continue;
             }
-            remove_file_only(&path, &mut out);
+            remove_regular_file(&path, &mut out);
         }
     }
 
-    // 3. The socket this session declared, only if it is under SOCKET_DIR.
-    if let Some(sock) = entry.messaging_socket_path.as_deref() {
-        let p = Path::new(sock);
-        if p.parent() == Some(Path::new(SOCKET_DIR)) {
-            if p.exists() {
-                remove_file_only(p, &mut out);
-            }
+    // 3. The socket this session declared. Three independent conditions, all
+    //    required: it sits DIRECTLY in socket_dir (a lexical parent check,
+    //    which also defeats `socket_dir/../x` since that parent is
+    //    `socket_dir/..`), it is named exactly `<pid>.sock`, and it really is
+    //    a socket or a regular file.
+    if let Some(declared) = entry.messaging_socket_path.as_deref() {
+        let p = Path::new(declared);
+        let in_dir = p.parent() == Some(socket_dir);
+        let right_name = p.file_name().and_then(|n| n.to_str()) == Some(&format!("{pid}.sock"));
+        if in_dir && right_name {
+            remove_socket_or_file(p, &mut out);
         } else {
-            out.skipped
-                .push(format!("{sock} (socket outside {SOCKET_DIR}; refused)"));
+            let why = if in_dir {
+                "not named <pid>.sock"
+            } else {
+                "outside the socket directory"
+            };
+            out.skipped.push(format!("{declared} ({why}; refused)"));
         }
     }
 
     Ok(out)
 }
 
-/// Remove a path only if it is a regular file. A directory — however it is
-/// named — is reported and left alone.
-fn remove_file_only(path: &Path, out: &mut RemovalOutcome) {
+/// Remove a path only if it is a regular file. Anything else — a directory, a
+/// symlink, a socket — is reported and left alone.
+fn remove_regular_file(path: &Path, out: &mut RemovalOutcome) {
     match std::fs::symlink_metadata(path) {
-        Ok(md) if md.is_file() => match std::fs::remove_file(path) {
-            Ok(()) => out.removed.push(path.to_path_buf()),
-            Err(e) => out.skipped.push(format!("{} ({e})", path.display())),
-        },
+        Ok(md) if md.is_file() => do_remove(path, out),
         Ok(_) => out
             .skipped
             .push(format!("{} (not a regular file; refused)", path.display())),
         Err(_) => {} // already gone; nothing to report
     }
 }
+
+/// Remove a path that may legitimately be a Unix domain socket.
+///
+/// A socket is NOT a regular file: real entries under the socket directory are
+/// `srw-------`, so `is_file()` is false for every one of them. Using the
+/// regular-file guard here would refuse every real socket while still passing
+/// any test whose fixture was created with `fs::write`. Symlinks are still
+/// refused, because `symlink_metadata` does not follow them.
+fn remove_socket_or_file(path: &Path, out: &mut RemovalOutcome) {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_socket() || md.is_file() => do_remove(path, out),
+        Ok(_) => out
+            .skipped
+            .push(format!("{} (not a socket or regular file; refused)", path.display())),
+        Err(_) => {}
+    }
+}
+
+fn do_remove(path: &Path, out: &mut RemovalOutcome) {
+    match std::fs::remove_file(path) {
+        Ok(()) => out.removed.push(path.to_path_buf()),
+        Err(e) => out.skipped.push(format!("{} ({e})", path.display())),
+    }
+}
 ```
 
-Add `pub mod registration;` to `src-tauri/src/sessions/mod.rs`.
+(The `mod` line was added in Step 1.)
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-cd src-tauri && cargo test sessions::registration 2>&1 | tail -14
+cd src-tauri && cargo test sessions::registration 2>&1 | tail -16
 ```
 
-Expected: `test result: ok. 8 passed`.
-
-Note: two of these tests write to the real `/tmp/cc-socks`. That directory is machine state, not user data, and the tests only create and remove a file named for a pid that does not exist. If `/tmp/cc-socks` is not writable in your environment, report it rather than deleting the test.
+Expected: `test result: ok. 11 passed`. Every test uses its own tempdir for both the sessions and the socket directory, so nothing touches the real `/tmp/cc-socks`.
 
 - [ ] **Step 5: Commit**
 
@@ -1770,7 +1903,9 @@ git commit -m "feat(sessions): allowlisted removal of dead session registrations
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-6.
-- Produces: `AppSettings { tray_show_sessions }`, `settings::load(&Path)`, `settings::save(&Path, &AppSettings)`; commands `list_sessions`, `remove_stale_registration`, `get_app_settings`, `set_tray_show_sessions`; `live_session_count(&AppHandle) -> usize`.
+- Produces: `AppSettings { tray_show_sessions }`, `settings::load(&Path)`, `settings::save(&Path, &AppSettings)`, `settings::SettingsPath(PathBuf)`; commands `list_sessions`, `remove_stale_registration`, `get_app_settings`, `set_tray_show_sessions`; `live_session_count(&AppHandle) -> usize`.
+
+**Why a newtype for the path:** Tauri's managed state is keyed by `TypeId`, and `manage` silently keeps the EXISTING value if that type is already managed. Nothing manages a bare `PathBuf` today, but any future plugin that did would silently redirect our settings file with no error. `SettingsPath` costs three lines and removes the whole class of problem.
 
 - [ ] **Step 1: Write the failing settings test**
 
@@ -1856,6 +1991,10 @@ pub fn load(path: &Path) -> AppSettings {
         .unwrap_or_default()
 }
 
+/// Wrapper so Tauri's `TypeId`-keyed state cannot collide with anything else
+/// that manages a bare `PathBuf`.
+pub struct SettingsPath(pub std::path::PathBuf);
+
 pub fn save(path: &Path, settings: &AppSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
@@ -1921,8 +2060,8 @@ Add a shared probe and settings path to managed state. In the `setup()` closure,
                 .app_data_dir()
                 .map_err(|e| format!("app data dir: {e}"))?
                 .join("settings.json");
-            app.manage(settings_path.clone());
-            app.manage(std::sync::Arc::new(sessions::probe::SysinfoProbe)
+            app.manage(settings::SettingsPath(settings_path.clone()));
+            app.manage(std::sync::Arc::new(sessions::probe::SysinfoProbe::new())
                 as std::sync::Arc<dyn sessions::probe::ProcessProbe>);
 ```
 
@@ -1934,21 +2073,25 @@ async fn list_sessions(
     app: AppHandle,
     worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
 ) -> Result<Vec<sessions::rows::SessionRow>, String> {
-    let roots = config::resolve(None);
     let probe = app
         .try_state::<std::sync::Arc<dyn sessions::probe::ProcessProbe>>()
         .ok_or("process probe unavailable")?
         .inner()
         .clone();
+    let worker = worker.inner().clone();
 
-    let files = sessions::registry::read_registry(&roots.sessions);
-    let reconciled = sessions::reconcile::reconcile(&files, probe.as_ref());
-    let usage = worker.session_usage();
-    Ok(sessions::rows::build_rows(
-        reconciled,
-        &usage,
-        usage::dates::now_ms(),
-    ))
+    // Off the async runtime: this reads the filesystem, probes processes, and
+    // takes the cache mutex — which the first full ingest holds for seconds.
+    // The UI polls every 2s, so blocking a runtime thread here would stack up.
+    tauri::async_runtime::spawn_blocking(move || {
+        let roots = config::resolve(None);
+        let files = sessions::registry::read_registry(&roots.sessions);
+        let reconciled = sessions::reconcile::reconcile(&files, probe.as_ref());
+        let usage = worker.session_usage();
+        sessions::rows::build_rows(reconciled, &usage, usage::dates::now_ms())
+    })
+    .await
+    .map_err(|e| format!("list_sessions failed: {e}"))
 }
 
 #[derive(serde::Serialize)]
@@ -1960,15 +2103,19 @@ struct RemovalReport {
 
 #[tauri::command]
 async fn remove_stale_registration(app: AppHandle, pid: u32) -> Result<RemovalReport, String> {
-    let roots = config::resolve(None);
     let probe = app
         .try_state::<std::sync::Arc<dyn sessions::probe::ProcessProbe>>()
         .ok_or("process probe unavailable")?
         .inner()
         .clone();
 
-    let outcome =
-        sessions::registration::remove_registration(&roots.sessions, pid, probe.as_ref())?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let roots = config::resolve(None);
+        sessions::registration::remove_registration(&roots.sessions, pid, probe.as_ref())
+    })
+    .await
+    .map_err(|e| format!("remove_stale_registration failed: {e}"))??;
+
     Ok(RemovalReport {
         removed: outcome
             .removed
@@ -1981,19 +2128,19 @@ async fn remove_stale_registration(app: AppHandle, pid: u32) -> Result<RemovalRe
 
 #[tauri::command]
 async fn get_app_settings(
-    path: tauri::State<'_, std::path::PathBuf>,
+    path: tauri::State<'_, settings::SettingsPath>,
 ) -> Result<settings::AppSettings, String> {
-    Ok(settings::load(path.inner()))
+    Ok(settings::load(&path.inner().0))
 }
 
 #[tauri::command]
 async fn set_tray_show_sessions(
     app: AppHandle,
-    path: tauri::State<'_, std::path::PathBuf>,
+    path: tauri::State<'_, settings::SettingsPath>,
     enabled: bool,
 ) -> Result<(), String> {
     settings::save(
-        path.inner(),
+        &path.inner().0,
         &settings::AppSettings {
             tray_show_sessions: enabled,
         },
@@ -2025,13 +2172,72 @@ and inside `update_tray_from_worker`, replace `let title = format_tokens(month_t
 
 ```rust
     let show = app
-        .try_state::<std::path::PathBuf>()
-        .map(|p| settings::load(p.inner()).tray_show_sessions)
+        .try_state::<settings::SettingsPath>()
+        .map(|p| settings::load(&p.inner().0).tray_show_sessions)
         .unwrap_or(true);
     let title = tray_title(month_tokens, live_session_count(app), show);
 ```
 
-- [ ] **Step 8: Run the suite and build**
+- [ ] **Step 8: Make the tray count able to go down**
+
+As written in Phase 1, `polling.rs` only refreshes the tray when a TRANSCRIPT
+changed (`files_read > 0 || files_retired > 0`), and `should_react` accepts only
+`.jsonl` under `projects` — so the `sessions/` watch it registers has its events
+discarded. The consequence: when you quit your last session and nothing writes a
+transcript afterwards, the title keeps showing `2.4M · 5` indefinitely, and the
+60 s fallback does not help because it is gated the same way.
+
+In `src-tauri/src/polling.rs`, widen the filter:
+
+```rust
+/// True when a batch of changed paths contains a transcript OR a session
+/// registration. Session events matter even when no transcript changed: the
+/// live session count in the tray has to be able to go down.
+pub fn should_react(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|p| {
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("jsonl") => p.components().any(|c| c.as_os_str() == "projects"),
+            Some("json") => p.components().any(|c| c.as_os_str() == "sessions"),
+            _ => false,
+        }
+    })
+}
+```
+
+and make `refresh` always repaint the tray, since the session count can change
+with no transcript activity at all:
+
+```rust
+    let report = worker.refresh_now();
+    if let Err(e) = worker.maybe_persist() {
+        eprintln!("[polling] could not persist cache: {}", e);
+    }
+    let _ = report; // persistence is gated; the tray is not
+    crate::update_tray_from_worker(app);
+```
+
+Add these tests beside the existing `should_react` ones:
+
+```rust
+    #[test]
+    fn reacts_to_session_registration_changes() {
+        // A session exiting removes its <pid>.json. Without this the tray's
+        // live count can only ever go up.
+        let paths = vec![PathBuf::from("/Users/me/.claude/sessions/12158.json")];
+        assert!(should_react(&paths));
+    }
+
+    #[test]
+    fn still_ignores_json_outside_the_sessions_directory() {
+        let paths = vec![
+            PathBuf::from("/Users/me/.claude/mcp-needs-auth-cache.json"),
+            PathBuf::from("/Users/me/.claude/file-history/x.json"),
+        ];
+        assert!(!should_react(&paths));
+    }
+```
+
+- [ ] **Step 9: Run the suite and build**
 
 ```bash
 cd src-tauri && cargo test 2>&1 | grep -E "^test result: ok" | head -1
@@ -2040,11 +2246,15 @@ cd .. && npx vite build 2>&1 | grep "built in"
 
 Expected: all Rust tests pass; frontend still builds.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src-tauri/src/settings.rs src-tauri/src/lib.rs
-git commit -m "feat(sessions): expose session commands and tray session count"
+git add src-tauri/src/settings.rs src-tauri/src/lib.rs src-tauri/src/polling.rs
+git commit -m "feat(sessions): session commands, tray session count, session-aware watcher
+
+The watcher previously discarded sessions/ events and only repainted the
+tray when a transcript changed, so the live session count could never go
+down once every session had exited."
 ```
 
 ---
@@ -2450,10 +2660,18 @@ Create `src/components/SessionsList.svelte`. The polling lifecycle is the part t
   import type { SessionRow as Row } from "../lib/types";
   import SessionRow from "./SessionRow.svelte";
 
+  interface Props {
+    onSettings: () => void;
+  }
+  let { onSettings }: Props = $props();
+
   const POLL_MS = 2000;
 
   let rows = $state<Row[]>([]);
-  let error = $state<string | null>(null);
+  // Two error slots on purpose: a successful poll every 2s would otherwise
+  // erase the "pid X is alive, refusing" message before it could be read.
+  let pollError = $state<string | null>(null);
+  let actionError = $state<string | null>(null);
   let loading = $state(true);
   let busyPid = $state<number | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -2464,9 +2682,9 @@ Create `src/components/SessionsList.svelte`. The polling lifecycle is the part t
   async function refresh() {
     try {
       rows = await listSessions();
-      error = null;
+      pollError = null;
     } catch (e) {
-      error = String(e);
+      pollError = String(e);
     } finally {
       loading = false;
     }
@@ -2511,20 +2729,51 @@ Create `src/components/SessionsList.svelte`. The polling lifecycle is the part t
 
   async function remove(pid: number) {
     busyPid = pid;
+    actionError = null;
     try {
       await removeStaleRegistration(pid);
       await refresh();
     } catch (e) {
-      error = String(e);
+      // Survives subsequent polls; cleared on the next attempt.
+      actionError = String(e);
     } finally {
       busyPid = null;
     }
   }
 </script>
 
+<!--
+  Sessions gets its own header rather than putting a gear in the tab bar:
+  Dashboard already owns a header with its refresh and settings buttons, and a
+  second gear in the tab strip would sit right beside Dashboard's own. This
+  keeps Dashboard untouched.
+-->
+<div class="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-gray-700">
+  <div>
+    <h1 class="text-sm font-semibold text-gray-900 dark:text-white">Sessions</h1>
+    <p class="text-[10px] text-gray-400 dark:text-gray-500">
+      {live.length} live{#if stale.length > 0} · {stale.length} stale{/if}
+    </p>
+  </div>
+  <button
+    onclick={onSettings}
+    class="rounded-md p-1.5 transition-colors hover:bg-gray-100 dark:hover:bg-gray-800"
+    title="Settings"
+    aria-label="Settings"
+  >
+    <svg class="h-4 w-4 text-gray-500 dark:text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+      <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+    </svg>
+  </button>
+</div>
+
 <div class="flex-1 overflow-y-auto">
-  {#if error}
-    <p class="px-4 py-3 text-xs text-amber-600 dark:text-amber-400">{error}</p>
+  {#if actionError}
+    <p class="px-4 py-2 text-xs text-red-600 dark:text-red-400">{actionError}</p>
+  {/if}
+  {#if pollError}
+    <p class="px-4 py-2 text-xs text-amber-600 dark:text-amber-400">{pollError}</p>
   {/if}
 
   {#if loading}
@@ -2568,9 +2817,10 @@ Replace `src/App.svelte` with:
   import Settings from "./components/Settings.svelte";
   import SessionsList from "./components/SessionsList.svelte";
 
-  type View = "usage" | "sessions" | "settings";
+  type Tab = "usage" | "sessions";
 
-  let view = $state<View>("usage");
+  let tab = $state<Tab>("usage");
+  let showSettings = $state(false);
 
   const tabClass = (active: boolean) =>
     active
@@ -2581,35 +2831,29 @@ Replace `src/App.svelte` with:
 <div
   class="w-[400px] h-[600px] bg-white dark:bg-gray-900 rounded-xl shadow-2xl overflow-hidden border border-gray-200 dark:border-gray-800 flex flex-col"
 >
-  {#if view === "settings"}
-    <Settings onBack={() => (view = "usage")} />
+  {#if showSettings}
+    <!-- Back returns to whichever tab opened Settings, not always Usage. -->
+    <Settings onBack={() => (showSettings = false)} />
   {:else}
     <div class="flex items-center gap-4 border-b border-gray-200 px-4 dark:border-gray-800">
-      <button class="py-2 text-sm {tabClass(view === 'usage')}" onclick={() => (view = "usage")}>
+      <button class="py-2 text-sm {tabClass(tab === 'usage')}" onclick={() => (tab = "usage")}>
         Usage
       </button>
-      <button class="py-2 text-sm {tabClass(view === 'sessions')}" onclick={() => (view = "sessions")}>
+      <button class="py-2 text-sm {tabClass(tab === 'sessions')}" onclick={() => (tab = "sessions")}>
         Sessions
-      </button>
-      <button
-        class="ml-auto py-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
-        onclick={() => (view = "settings")}
-        aria-label="Settings"
-      >
-        ⚙
       </button>
     </div>
 
-    {#if view === "usage"}
-      <Dashboard onSettings={() => (view = "settings")} />
+    {#if tab === "usage"}
+      <Dashboard onSettings={() => (showSettings = true)} />
     {:else}
-      <SessionsList />
+      <SessionsList onSettings={() => (showSettings = true)} />
     {/if}
   {/if}
 </div>
 ```
 
-`Dashboard.svelte` keeps its `onSettings` prop, so its own header gear still works; leave its internals alone.
+**`Dashboard.svelte` is not modified at all.** It keeps its `onSettings` prop and its own header (title, refresh, gear), which is exactly why the tab strip has no gear of its own — two would sit side by side. `Settings` is a full-screen overlay rather than a third tab, so returning from it lands back on the tab that opened it.
 
 - [ ] **Step 8: Add the tray toggle to Settings**
 
@@ -2725,8 +2969,24 @@ json.dump({"pid": 999001, "sessionId": "fake-stale-session",
            "messagingSocketPath": "/tmp/cc-socks/999001.sock"}, open(p, 'w'))
 print("wrote", p)
 EOF
-touch /tmp/cc-socks/999001.sock 2>/dev/null || true
+python3 - <<'EOF'
+import os, socket
+os.makedirs('/tmp/cc-socks', exist_ok=True)
+path = '/tmp/cc-socks/999001.sock'
+if os.path.exists(path):
+    os.unlink(path)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)   # a REAL socket: srw-------, not a regular file
+s.close()
+import stat
+print('is socket:', stat.S_ISSOCK(os.lstat(path).st_mode))
+EOF
 ```
+
+**Bind it, do not `touch` it.** A `touch`ed path is a regular file, and a
+regular file would be removed by a guard that refuses real sockets — so
+touching here would let a broken implementation pass this gate. The script
+prints `is socket: True`; if it does not, stop and fix the fixture.
 
 The Sessions tab must show it under **Stale registrations** within ~2 s, with a Clear button and no uptime. Click Clear, then confirm both files are gone:
 
@@ -2736,7 +2996,17 @@ ls ~/.claude/sessions/999001.json /tmp/cc-socks/999001.sock 2>&1
 
 Expected: both "No such file or directory".
 
-- [ ] **Step 5: Verify the live-session guard**
+- [ ] **Step 5: Verify the tray count goes DOWN**
+
+The session count must fall when a session exits, including when nothing writes
+a transcript afterwards — which is the ordinary "closed everything" case.
+
+Note the current tray title, then quit one Claude Code session and leave the
+machine idle (do not type into any other session). Within about a minute the
+title's `· N` must decrease by one. If it stays put, the watcher is discarding
+`sessions/` events or the tray repaint is still gated on transcript activity.
+
+- [ ] **Step 6: Verify the live-session guard**
 
 Pick a REAL live pid from Step 1 and hand-edit nothing — instead confirm the guard by temporarily writing a registration whose pid is your own shell (`echo $$`) and whose `startedAt` is now; that row must appear as **Live** with no Clear button. Remove the file yourself afterwards:
 
@@ -2744,18 +3014,19 @@ Pick a REAL live pid from Step 1 and hand-edit nothing — instead confirm the g
 rm -f ~/.claude/sessions/$$.json
 ```
 
-- [ ] **Step 6: Verify the toggle**
+- [ ] **Step 7: Verify the toggle**
 
 Turn off "Show live session count" in Settings; the tray must drop the `· N` suffix immediately. Quit and relaunch; it must stay off. Turn it back on.
 
-- [ ] **Step 7: Record the outcome**
+- [ ] **Step 8: Record the outcome**
 
 ```bash
 git commit --allow-empty -m "test: verify Phase 2 sessions tab against real sessions
 
 Live rows matched the registry and process list; idle age tracked
-non-usage activity; a manufactured stale registration was listed and
-cleared; a live session offered no Clear action; tray toggle persisted."
+non-usage activity; a manufactured stale registration with a REAL bound
+socket was listed and fully cleared; a live session offered no Clear
+action; the tray count fell when a session exited; toggle persisted."
 ```
 
 ---
@@ -2763,11 +3034,17 @@ cleared; a live session offered no Clear action; tray toggle persisted."
 ## Definition of done
 
 - [ ] `cargo test` green, `npm test` green (51 tests), `npx vite build` succeeds.
-- [ ] `cargo clippy --all-targets` introduces no new warnings.
+- [ ] `cargo clippy --all-targets` introduces no new warnings. Record the count
+      before starting and after finishing; they must match. (Phase 1 left a
+      non-zero baseline, so "zero warnings" is not the bar — "no NEW warnings"
+      is. `FakeProbe` is `#[cfg(test)]` and the unread `kind` /
+      `start_time_secs` fields were dropped precisely to hold this line.)
 - [ ] The Sessions tab lists exactly the live sessions the registry and process table agree on.
 - [ ] A session with no transcript renders "no activity yet" rather than an error or a bogus age.
 - [ ] Idle age reflects non-usage activity (a long Bash call does not read as idle).
-- [ ] A live session offers no Clear action; a stale one does, and clearing removes only its own files.
+- [ ] A live session offers no Clear action; a stale one does, and clearing removes only its own files — including a REAL Unix domain socket, which is not a regular file.
+- [ ] The tray's session count decreases when a session exits with no transcript activity following it.
+- [ ] A Clear failure message survives the 2-second poll instead of flashing.
 - [ ] Removal refuses a pid that is alive and still that session.
 - [ ] Subagents appear nested, labelled, and marked not individually stoppable.
 - [ ] Tray shows `· N` when enabled and non-zero; the toggle persists across a restart.
