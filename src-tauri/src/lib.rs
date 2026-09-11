@@ -10,6 +10,7 @@ mod polling;
 mod usage;
 mod config;
 mod sessions;
+mod settings;
 
 // --- Stats Cache Types (matches ~/.claude/stats-cache.json) ---
 
@@ -79,6 +80,16 @@ pub fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// The menu bar title. Kept pure so it is testable without a tray.
+pub fn tray_title(month_tokens: u64, live_sessions: usize, show_sessions: bool) -> String {
+    let base = format_tokens(month_tokens);
+    if show_sessions && live_sessions > 0 {
+        format!("{base} · {live_sessions}")
+    } else {
+        base
+    }
+}
+
 pub fn current_month_prefix() -> String {
     usage::dates::local_month_prefix(usage::dates::now_ms())
 }
@@ -93,6 +104,18 @@ pub fn current_month_tokens(stats: &StatsCache) -> u64 {
         .sum()
 }
 
+pub fn live_session_count(app: &AppHandle) -> usize {
+    let Some(probe) = app.try_state::<std::sync::Arc<dyn sessions::probe::ProcessProbe>>() else {
+        return 0;
+    };
+    let roots = config::resolve(None);
+    let files = sessions::registry::read_registry(&roots.sessions);
+    sessions::reconcile::reconcile(&files, probe.inner().as_ref())
+        .iter()
+        .filter(|r| r.state == sessions::reconcile::SessionState::Live)
+        .count()
+}
+
 pub fn update_tray_from_worker(app: &AppHandle) {
     let worker = match app.try_state::<std::sync::Arc<usage::worker::UsageWorker>>() {
         Some(w) => w.inner().clone(),
@@ -100,7 +123,11 @@ pub fn update_tray_from_worker(app: &AppHandle) {
     };
     let stats = worker.snapshot();
     let month_tokens = current_month_tokens(&stats);
-    let title = format_tokens(month_tokens);
+    let show = app
+        .try_state::<settings::SettingsPath>()
+        .map(|p| settings::load(&p.inner().0).tray_show_sessions)
+        .unwrap_or(true);
+    let title = tray_title(month_tokens, live_session_count(app), show);
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_title(Some(&title));
     }
@@ -147,6 +174,87 @@ async fn update_tray_title(app: AppHandle, title: String) -> Result<(), String> 
     Ok(())
 }
 
+#[tauri::command]
+async fn list_sessions(
+    app: AppHandle,
+    worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
+) -> Result<Vec<sessions::rows::SessionRow>, String> {
+    let probe = app
+        .try_state::<std::sync::Arc<dyn sessions::probe::ProcessProbe>>()
+        .ok_or("process probe unavailable")?
+        .inner()
+        .clone();
+    let worker = worker.inner().clone();
+
+    // Off the async runtime: this reads the filesystem, probes processes, and
+    // takes the cache mutex — which the first full ingest holds for seconds.
+    // The UI polls every 2s, so blocking a runtime thread here would stack up.
+    tauri::async_runtime::spawn_blocking(move || {
+        let roots = config::resolve(None);
+        let files = sessions::registry::read_registry(&roots.sessions);
+        let reconciled = sessions::reconcile::reconcile(&files, probe.as_ref());
+        let usage = worker.session_usage();
+        sessions::rows::build_rows(reconciled, &usage, usage::dates::now_ms())
+    })
+    .await
+    .map_err(|e| format!("list_sessions failed: {e}"))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovalReport {
+    removed: Vec<String>,
+    skipped: Vec<String>,
+}
+
+#[tauri::command]
+async fn remove_stale_registration(app: AppHandle, pid: u32) -> Result<RemovalReport, String> {
+    let probe = app
+        .try_state::<std::sync::Arc<dyn sessions::probe::ProcessProbe>>()
+        .ok_or("process probe unavailable")?
+        .inner()
+        .clone();
+
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let roots = config::resolve(None);
+        sessions::registration::remove_registration(&roots.sessions, pid, probe.as_ref())
+    })
+    .await
+    .map_err(|e| format!("remove_stale_registration failed: {e}"))??;
+
+    Ok(RemovalReport {
+        removed: outcome
+            .removed
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        skipped: outcome.skipped,
+    })
+}
+
+#[tauri::command]
+async fn get_app_settings(
+    path: tauri::State<'_, settings::SettingsPath>,
+) -> Result<settings::AppSettings, String> {
+    Ok(settings::load(&path.inner().0))
+}
+
+#[tauri::command]
+async fn set_tray_show_sessions(
+    app: AppHandle,
+    path: tauri::State<'_, settings::SettingsPath>,
+    enabled: bool,
+) -> Result<(), String> {
+    settings::save(
+        &path.inner().0,
+        &settings::AppSettings {
+            tray_show_sessions: enabled,
+        },
+    )?;
+    update_tray_from_worker(&app);
+    Ok(())
+}
+
 // --- Tray & Window Setup ---
 
 fn toggle_popover(app: &AppHandle) {
@@ -173,6 +281,10 @@ pub fn run() {
             get_diagnostics,
             refresh_usage,
             update_tray_title,
+            list_sessions,
+            remove_stale_registration,
+            get_app_settings,
+            set_tray_show_sessions,
         ])
         .setup(|app| {
             let roots = config::resolve(None);
@@ -183,6 +295,15 @@ pub fn run() {
                 .join("usage-cache.v1.json");
             let worker = std::sync::Arc::new(usage::worker::UsageWorker::new(roots, cache_path));
             app.manage(worker.clone());
+
+            let settings_path = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app data dir: {e}"))?
+                .join("settings.json");
+            app.manage(settings::SettingsPath(settings_path.clone()));
+            app.manage(std::sync::Arc::new(sessions::probe::SysinfoProbe::new())
+                as std::sync::Arc<dyn sessions::probe::ProcessProbe>);
 
             // First pass on a background thread so app startup is not blocked.
             // Measured: a full 793 MB pass takes seconds. Note the worker mutex
@@ -397,6 +518,16 @@ mod tests {
         );
 
         assert_eq!(current_month_tokens(&stats), 8000);
+    }
+
+    // --- tray_title ---
+
+    #[test]
+    fn tray_title_appends_session_count_only_when_enabled_and_nonzero() {
+        assert_eq!(tray_title(2_400_000, 5, true), "2.4M · 5");
+        assert_eq!(tray_title(2_400_000, 0, true), "2.4M", "zero sessions adds nothing");
+        assert_eq!(tray_title(2_400_000, 5, false), "2.4M", "toggle off suppresses it");
+        assert_eq!(tray_title(0, 3, true), "0 · 3");
     }
 
     // --- Serde round-trip ---

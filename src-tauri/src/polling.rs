@@ -15,11 +15,16 @@ pub const DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Fallback refresh when no filesystem event arrives.
 const FALLBACK_POLL: Duration = Duration::from_secs(60);
 
-/// True when a batch of changed paths contains at least one transcript.
+/// True when a batch of changed paths contains a transcript OR a session
+/// registration. Session events matter even when no transcript changed: the
+/// live session count in the tray has to be able to go down.
 pub fn should_react(paths: &[PathBuf]) -> bool {
     paths.iter().any(|p| {
-        p.extension().and_then(|e| e.to_str()) == Some("jsonl")
-            && p.components().any(|c| c.as_os_str() == "projects")
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("jsonl") => p.components().any(|c| c.as_os_str() == "projects"),
+            Some("json") => p.components().any(|c| c.as_os_str() == "sessions"),
+            _ => false,
+        }
     })
 }
 
@@ -85,15 +90,11 @@ fn refresh(app: &AppHandle) {
         None => return,
     };
     let report = worker.refresh_now();
-    // maybe_persist writes only when a scan changed something and the throttle
-    // window has passed. Persisting unconditionally here would write several MB
-    // on every 60s fallback tick — gigabytes a day at idle.
     if let Err(e) = worker.maybe_persist() {
         eprintln!("[polling] could not persist cache: {}", e);
     }
-    if report.files_read > 0 || report.files_retired > 0 {
-        crate::update_tray_from_worker(app);
-    }
+    let _ = report; // persistence is gated; the tray is not
+    crate::update_tray_from_worker(app);
 }
 
 #[cfg(test)]
@@ -143,6 +144,23 @@ mod tests {
         let paths = vec![PathBuf::from(
             "/Users/me/Library/Application Support/com.claudetokenusage.dev/usage-cache.v1.json",
         )];
+        assert!(!should_react(&paths));
+    }
+
+    #[test]
+    fn reacts_to_session_registration_changes() {
+        // A session exiting removes its <pid>.json. Without this the tray's
+        // live count can only ever go up.
+        let paths = vec![PathBuf::from("/Users/me/.claude/sessions/12158.json")];
+        assert!(should_react(&paths));
+    }
+
+    #[test]
+    fn still_ignores_json_outside_the_sessions_directory() {
+        let paths = vec![
+            PathBuf::from("/Users/me/.claude/mcp-needs-auth-cache.json"),
+            PathBuf::from("/Users/me/.claude/file-history/x.json"),
+        ];
         assert!(!should_react(&paths));
     }
 
