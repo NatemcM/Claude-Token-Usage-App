@@ -57,6 +57,7 @@ npx vite build           # Frontend-only build (for debugging)
 - **Tray icon** - Must be black on transparent PNG (8-bit RGBA). macOS template icons use alpha channel for shape. Set `icon_as_template(true)`
 - **Window transparency** - Requires `"macOSPrivateApi": true` in tauri.conf.json and `"transparent": true` on the window config. Cannot use `.transparent()` on `WebviewWindowBuilder` in Tauri v2
 - **Rust `time` crate** - If build fails requiring Rust 1.88+, pin with `cargo update time@0.3.47 --precise 0.3.41`
+- **`sysinfo` must stay pinned to 0.35** - 0.37 requires rustc 1.88 and 0.39 requires rustc 1.95; the toolchain here is rustc 1.86. Bumping it fails the build with `requires rustc 1.xx`. Same class of problem as the `time` crate pin above.
 - **DMG bundling may fail** - Use `--bundles app` to skip DMG and build just the `.app`
 
 ## Conventions

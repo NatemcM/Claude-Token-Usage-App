@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getStats, getDiagnostics, refreshUsage } from "../lib/api";
-  import type { StatsCache, Diagnostics } from "../lib/types";
+  import { getStats, getDiagnostics, refreshUsage, getAppSettings, setTrayShowSessions } from "../lib/api";
+  import type { StatsCache, Diagnostics, AppSettings } from "../lib/types";
 
   interface Props {
     onBack: () => void;
@@ -12,6 +12,7 @@
   let stats = $state<StatsCache | null>(null);
   let diagnostics = $state<Diagnostics | null>(null);
   let refreshing = $state(false);
+  let appSettings = $state<AppSettings | null>(null);
 
   onMount(async () => {
     try {
@@ -29,6 +30,14 @@
     }
   });
 
+  onMount(async () => {
+    try {
+      appSettings = await getAppSettings();
+    } catch {
+      appSettings = null;
+    }
+  });
+
   async function rescan() {
     refreshing = true;
     try {
@@ -37,6 +46,11 @@
     } finally {
       refreshing = false;
     }
+  }
+
+  async function toggleTraySessions(enabled: boolean) {
+    await setTrayShowSessions(enabled);
+    appSettings = { trayShowSessions: enabled };
   }
 </script>
 
@@ -149,6 +163,24 @@
       <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-2">
         The menu bar updates automatically when Claude Code writes new stats.
       </p>
+    </div>
+
+    <!-- Menu bar -->
+    <div>
+      <h3 class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-3">Menu bar</h3>
+      <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3 space-y-2">
+        <label class="flex items-center justify-between">
+          <span class="text-sm text-gray-600 dark:text-gray-400">Show live session count</span>
+          <input
+            type="checkbox"
+            checked={appSettings?.trayShowSessions ?? true}
+            onchange={(e) => toggleTraySessions(e.currentTarget.checked)}
+          />
+        </label>
+        <p class="text-xs text-gray-500 dark:text-gray-500">
+          Appends the number of running sessions after the token total.
+        </p>
+      </div>
     </div>
 
     <!-- About -->
