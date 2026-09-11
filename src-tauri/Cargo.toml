@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["time"] }
 notify = "7"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sysinfo = "0.35"
 
 [dev-dependencies]
 tempfile = "3"

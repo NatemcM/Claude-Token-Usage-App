@@ -9,6 +9,7 @@ use std::collections::HashMap;
 mod polling;
 mod usage;
 mod config;
+mod sessions;
 
 // --- Stats Cache Types (matches ~/.claude/stats-cache.json) ---
 
