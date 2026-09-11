@@ -84,8 +84,17 @@ pub fn build_rows(
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("pid {}", r.file.pid)),
+                // The registry cwd is the session's own declaration of its
+                // working directory and is authoritative and stable. A
+                // session's transcript records can carry several different
+                // cwds if the user changed directory mid-session, and which
+                // one `SessionUsage.cwd` ends up holding depends on HashMap
+                // iteration order (randomised per process) over those
+                // records — so it must only ever be a fallback, and both
+                // fields must agree on the same precedence or the row shows
+                // an inconsistent project/cwd pair.
                 project: project_label(
-                    u.and_then(|u| u.cwd.as_deref()).or(r.file.cwd.as_deref()),
+                    r.file.cwd.as_deref().or_else(|| u.and_then(|u| u.cwd.as_deref())),
                 ),
                 cwd: r.file.cwd.clone().or_else(|| u.and_then(|u| u.cwd.clone())),
                 git_branch: u.and_then(|u| u.git_branch.clone()),
@@ -313,5 +322,56 @@ mod tests {
         let rows = build_rows(vec![rec(100, "s-1", NOW - 1_000, SessionState::Live)], &u, NOW);
         assert_eq!(rows[0].idle_secs, Some(0));
         assert!(rows[0].is_active);
+    }
+
+    #[test]
+    fn project_and_cwd_both_prefer_the_registry_over_a_drifting_usage_cwd() {
+        // Real observed pair: the user cd'd mid-session, so the transcript's
+        // records carry two different cwds (47,601 records under
+        // .../platform.hotelierkit.com/platform, 11,771 under
+        // .../platform.hotelierkit.com). SessionUsage.cwd is whichever one the
+        // HashMap iteration over those records reached first - not stable
+        // across runs. The registry's own declared cwd must win for both
+        // fields so they never disagree with each other.
+        let mut r = rec(100, "s-1", NOW - 1_000, SessionState::Live);
+        r.file.cwd = Some("/Users/me/Projects/platform.hotelierkit.com".to_string());
+        let mut s = usage("s-1", NOW - 1_000, 1);
+        s.cwd = Some("/Users/me/Projects/platform.hotelierkit.com/platform".to_string());
+        let mut u = HashMap::new();
+        u.insert("s-1".to_string(), s);
+
+        let rows = build_rows(vec![r], &u, NOW);
+        let row = &rows[0];
+        assert_eq!(row.project, "platform.hotelierkit.com", "registry wins, NOT \"platform\"");
+        assert_eq!(
+            row.cwd.as_deref(),
+            Some("/Users/me/Projects/platform.hotelierkit.com")
+        );
+        assert_eq!(
+            row.project,
+            std::path::Path::new(row.cwd.as_deref().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "project and cwd must be consistent with each other"
+        );
+    }
+
+    #[test]
+    fn project_falls_back_to_usage_cwd_when_the_registry_has_none() {
+        let mut r = rec(100, "s-1", NOW - 1_000, SessionState::Live);
+        r.file.cwd = None;
+        let mut s = usage("s-1", NOW - 1_000, 1);
+        s.cwd = Some("/Users/me/Projects/platform.hotelierkit.com/platform".to_string());
+        let mut u = HashMap::new();
+        u.insert("s-1".to_string(), s);
+
+        let rows = build_rows(vec![r], &u, NOW);
+        let row = &rows[0];
+        assert_eq!(row.project, "platform", "falls back to the usage cwd's basename");
+        assert_eq!(
+            row.cwd.as_deref(),
+            Some("/Users/me/Projects/platform.hotelierkit.com/platform")
+        );
     }
 }
