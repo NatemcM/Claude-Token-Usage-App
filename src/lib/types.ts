@@ -77,3 +77,49 @@ export interface Diagnostics {
   /** Display form of the projects root actually in use. */
   projectsRoot: string;
 }
+
+// --- Sessions (Phase 2) ---
+
+export interface AgentRow {
+  agentId: string;
+  /** Absent on some subagent records. */
+  agentType: string | null;
+  tokens: number;
+  idleSecs: number;
+  /** Always false: subagents share their parent's process. */
+  killable: boolean;
+}
+
+export interface SessionRow {
+  state: "live" | "stale";
+  pid: number;
+  sessionId: string;
+  name: string;
+  cwd: string | null;
+  /** Last path component of cwd. */
+  project: string;
+  gitBranch: string | null;
+  entrypoint: string | null;
+  version: string | null;
+  startedAtMs: number;
+  /** null for a stale row: the process is gone. */
+  uptimeSecs: number | null;
+  /** null when the session has written no transcript yet. */
+  lastActivityMs: number | null;
+  idleSecs: number | null;
+  tokens: number;
+  messageCount: number;
+  isActive: boolean;
+  /** Only stale rows can be cleared, and only their registration files. */
+  removable: boolean;
+  agents: AgentRow[];
+}
+
+export interface RemovalReport {
+  removed: string[];
+  skipped: string[];
+}
+
+export interface AppSettings {
+  trayShowSessions: boolean;
+}

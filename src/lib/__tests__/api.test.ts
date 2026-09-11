@@ -1,7 +1,14 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { getCurrentMonthPrefix } from "../api";
 import { invoke } from "@tauri-apps/api/core";
-import { getDiagnostics, refreshUsage } from "../api";
+import {
+  getDiagnostics,
+  refreshUsage,
+  listSessions,
+  removeStaleRegistration,
+  getAppSettings,
+  setTrayShowSessions,
+} from "../api";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -70,5 +77,61 @@ describe("usage commands", () => {
     vi.mocked(invoke).mockResolvedValueOnce(undefined);
     await refreshUsage();
     expect(invoke).toHaveBeenCalledWith("refresh_usage");
+  });
+});
+
+describe("session commands", () => {
+  afterEach(() => {
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("listSessions invokes list_sessions and decodes rows", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([
+      {
+        state: "live",
+        pid: 12158,
+        sessionId: "s-1",
+        name: "my-app-42",
+        cwd: "/Users/me/Projects/my-app",
+        project: "my-app",
+        gitBranch: "main",
+        entrypoint: "claude-vscode",
+        version: "2.1.267",
+        startedAtMs: 1789029119710,
+        uptimeSecs: 3600,
+        lastActivityMs: 1789029179076,
+        idleSecs: 120,
+        tokens: 1234567,
+        messageCount: 12,
+        isActive: true,
+        removable: false,
+        agents: [
+          { agentId: "a1", agentType: "Explore", tokens: 210000, idleSecs: 5, killable: false },
+        ],
+      },
+    ]);
+
+    const rows = await listSessions();
+    expect(invoke).toHaveBeenCalledWith("list_sessions");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].project).toBe("my-app");
+    expect(rows[0].agents[0].killable).toBe(false);
+  });
+
+  it("removeStaleRegistration passes the pid", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ removed: ["/x/4242.json"], skipped: [] });
+    const r = await removeStaleRegistration(4242);
+    expect(invoke).toHaveBeenCalledWith("remove_stale_registration", { pid: 4242 });
+    expect(r.removed).toHaveLength(1);
+  });
+
+  it("getAppSettings and setTrayShowSessions map to their commands", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ trayShowSessions: true });
+    expect((await getAppSettings()).trayShowSessions).toBe(true);
+    expect(invoke).toHaveBeenCalledWith("get_app_settings");
+
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
+    await setTrayShowSessions(false);
+    expect(invoke).toHaveBeenCalledWith("set_tray_show_sessions", { enabled: false });
   });
 });
