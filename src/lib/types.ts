@@ -62,3 +62,18 @@ export interface DailyMessages {
   messages: number;
   toolCalls: number;
 }
+
+// --- Ingest diagnostics (from the Rust usage worker) ---
+
+export interface Diagnostics {
+  malformedLines: number;
+  /** Messages a later copy revised upward. ~30% is normal, not an error. */
+  revisedMessages: number;
+  filesTracked: number;
+  filesRetired: number;
+  lastScanMs: number;
+  /** Last date key covered by the one-time legacy seed, or null if none exists. */
+  legacyThrough: string | null;
+  /** Display form of the projects root actually in use. */
+  projectsRoot: string;
+}

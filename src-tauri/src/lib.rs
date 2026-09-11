@@ -5,9 +5,10 @@ use tauri::{
 use tauri_plugin_positioner::{Position, WindowExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 mod polling;
+mod usage;
+mod config;
 
 // --- Stats Cache Types (matches ~/.claude/stats-cache.json) ---
 
@@ -65,19 +66,6 @@ pub struct LongestSession {
 
 // --- Helpers ---
 
-pub fn stats_cache_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".claude").join("stats-cache.json")
-}
-
-pub fn read_stats() -> Result<StatsCache, String> {
-    let path = stats_cache_path();
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Could not read stats file at {:?}: {}", path, e))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Could not parse stats file: {}", e))
-}
-
 pub fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000_000 {
         format!("{:.1}B", tokens as f64 / 1_000_000_000.0)
@@ -91,37 +79,7 @@ pub fn format_tokens(tokens: u64) -> String {
 }
 
 pub fn current_month_prefix() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = now / 86400;
-    let mut y = 1970i32;
-    let mut remaining = days as i32;
-    loop {
-        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-        let days_in_year = if leap { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ];
-    let mut m = 1usize;
-    for &md in &month_days {
-        if remaining < md {
-            break;
-        }
-        remaining -= md;
-        m += 1;
-    }
-    format!("{:04}-{:02}", y, m)
+    usage::dates::local_month_prefix(usage::dates::now_ms())
 }
 
 pub fn current_month_tokens(stats: &StatsCache) -> u64 {
@@ -134,23 +92,49 @@ pub fn current_month_tokens(stats: &StatsCache) -> u64 {
         .sum()
 }
 
-pub fn update_tray_from_stats(app: &AppHandle) {
-    if let Ok(stats) = read_stats() {
-        let month_tokens = current_month_tokens(&stats);
-        let title = format_tokens(month_tokens);
-        if let Some(tray) = app.tray_by_id("main-tray") {
-            let _ = tray.set_title(Some(&title));
-        }
-        // Notify frontend
-        let _ = app.emit("stats-updated", ());
+pub fn update_tray_from_worker(app: &AppHandle) {
+    let worker = match app.try_state::<std::sync::Arc<usage::worker::UsageWorker>>() {
+        Some(w) => w.inner().clone(),
+        None => return,
+    };
+    let stats = worker.snapshot();
+    let month_tokens = current_month_tokens(&stats);
+    let title = format_tokens(month_tokens);
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_title(Some(&title));
     }
+    let _ = app.emit("stats-updated", ());
 }
 
 // --- Tauri Commands ---
 
 #[tauri::command]
-async fn get_stats() -> Result<StatsCache, String> {
-    read_stats()
+async fn get_stats(worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>) -> Result<StatsCache, String> {
+    Ok(worker.snapshot())
+}
+
+#[tauri::command]
+async fn get_diagnostics(
+    worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
+) -> Result<usage::worker::Diagnostics, String> {
+    Ok(worker.diagnostics())
+}
+
+#[tauri::command]
+async fn refresh_usage(
+    worker: tauri::State<'_, std::sync::Arc<usage::worker::UsageWorker>>,
+) -> Result<(), String> {
+    let worker = worker.inner().clone();
+    // A full rescan plus a ~10 MB write would otherwise block a tokio worker
+    // thread for the duration; run it off the async runtime instead.
+    tauri::async_runtime::spawn_blocking(move || {
+        worker.refresh_now();
+        // Explicit user action: write immediately rather than waiting for the
+        // throttle window.
+        worker.persist()
+    })
+    .await
+    .map_err(|e| format!("refresh_usage task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -185,9 +169,37 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .invoke_handler(tauri::generate_handler![
             get_stats,
+            get_diagnostics,
+            refresh_usage,
             update_tray_title,
         ])
         .setup(|app| {
+            let roots = config::resolve(None);
+            let cache_path = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app data dir: {}", e))?
+                .join("usage-cache.v1.json");
+            let worker = std::sync::Arc::new(usage::worker::UsageWorker::new(roots, cache_path));
+            app.manage(worker.clone());
+
+            // First pass on a background thread so app startup is not blocked.
+            // Measured: a full 793 MB pass takes seconds. Note the worker mutex
+            // IS held for that pass, so a popover opened during it waits for
+            // the scan to finish rather than showing a partial figure.
+            {
+                let handle = app.handle().clone();
+                let worker = worker.clone();
+                std::thread::spawn(move || {
+                    let mut cb = |done: usize, total: usize| {
+                        let _ = handle.emit("usage-progress", (done, total));
+                    };
+                    worker.refresh_with_progress(Some(&mut cb));
+                    let _ = worker.persist();
+                    update_tray_from_worker(&handle);
+                });
+            }
+
             // Create tray icon from dedicated template image
             let tray_icon = tauri::image::Image::from_bytes(
                 include_bytes!("../icons/tray-icon.png"),
@@ -222,12 +234,14 @@ pub fn run() {
                 });
             }
 
-            // Set initial tray title
+            // Initial tray title is set by the spawned first-pass thread above
+            // once its scan completes (it calls update_tray_from_worker
+            // itself). A synchronous call here would block the Tauri event
+            // loop on the worker mutex until that ~800 MB first pass finishes.
             let handle = app.handle().clone();
-            update_tray_from_stats(&handle);
 
             // Watch stats file for changes
-            polling::start(handle);
+            polling::start(handle, config::resolve(None));
 
             Ok(())
         })
@@ -238,13 +252,20 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-    app.run(|_app_handle, _event| {});
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(worker) =
+                app_handle.try_state::<std::sync::Arc<usage::worker::UsageWorker>>()
+            {
+                let _ = worker.inner().persist();
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn make_model_usage(input: u64, output: u64, cache_read: u64, cache_create: u64) -> ModelUsage {
         ModelUsage {
@@ -309,6 +330,27 @@ mod tests {
     }
 
     // --- current_month_prefix ---
+
+    #[test]
+    fn current_month_prefix_matches_local_time_not_utc() {
+        // The hand-rolled UTC epoch-day math disagreed with the frontend's
+        // local-time month for the first hours of each month east of UTC.
+        let expected = crate::usage::dates::local_month_prefix(
+            crate::usage::dates::now_ms(),
+        );
+        assert_eq!(current_month_prefix(), expected);
+    }
+
+    #[test]
+    fn current_month_prefix_is_well_formed() {
+        let p = current_month_prefix();
+        assert_eq!(p.len(), 7, "expected YYYY-MM, got {}", p);
+        assert_eq!(&p[4..5], "-");
+        let year: i32 = p[0..4].parse().expect("year");
+        let month: u32 = p[5..7].parse().expect("month");
+        assert!(year >= 2026, "year was {}", year);
+        assert!((1..=12).contains(&month), "month was {}", month);
+    }
 
     #[test]
     fn current_month_prefix_format() {
@@ -377,76 +419,5 @@ mod tests {
         assert_eq!(usage.output_tokens, 2000);
         assert_eq!(usage.cache_read_input_tokens, 500);
         assert_eq!(usage.cache_creation_input_tokens, 300);
-    }
-
-    // --- JSON parsing ---
-
-    #[test]
-    fn parse_valid_stats_json() {
-        let json = r#"{
-            "version": 1,
-            "lastComputedDate": "2026-02-25",
-            "dailyActivity": [],
-            "dailyModelTokens": [],
-            "modelUsage": {
-                "claude-opus-4-6": {
-                    "inputTokens": 100,
-                    "outputTokens": 200,
-                    "cacheReadInputTokens": 50,
-                    "cacheCreationInputTokens": 25,
-                    "webSearchRequests": 0,
-                    "costUsd": 0.01
-                }
-            },
-            "totalSessions": 5,
-            "totalMessages": 42,
-            "longestSession": null,
-            "firstSessionDate": "2026-01-01",
-            "hourCounts": null
-        }"#;
-
-        let parsed: StatsCache = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.total_sessions, 5);
-        assert_eq!(parsed.total_messages, 42);
-        assert_eq!(parsed.model_usage.len(), 1);
-
-        let opus = &parsed.model_usage["claude-opus-4-6"];
-        assert_eq!(opus.input_tokens, 100);
-        assert_eq!(opus.output_tokens, 200);
-    }
-
-    #[test]
-    fn reject_invalid_json() {
-        let result: Result<StatsCache, _> = serde_json::from_str("not valid json");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_stats_from_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("stats-cache.json");
-        let mut file = std::fs::File::create(&file_path).unwrap();
-        write!(
-            file,
-            r#"{{
-                "version": 1,
-                "lastComputedDate": "2026-02-25",
-                "dailyActivity": [],
-                "dailyModelTokens": [],
-                "modelUsage": {{}},
-                "totalSessions": 3,
-                "totalMessages": 10,
-                "longestSession": null,
-                "firstSessionDate": null,
-                "hourCounts": null
-            }}"#
-        )
-        .unwrap();
-
-        let contents = std::fs::read_to_string(&file_path).unwrap();
-        let parsed: StatsCache = serde_json::from_str(&contents).unwrap();
-        assert_eq!(parsed.total_sessions, 3);
-        assert_eq!(parsed.total_messages, 10);
-        assert!(parsed.model_usage.is_empty());
     }
 }
